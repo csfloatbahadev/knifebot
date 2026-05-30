@@ -8,57 +8,45 @@ const { Pool } = require("undici");
 const CONFIG = {
   CSFLOAT_API_KEY: process.env.CSFLOAT_API_KEY,
 
-  // Knife families to scan (matched against market_hash_name, case-insensitive)
   KNIFE_FAMILIES: (process.env.KNIFE_FAMILIES || "Talon,Karambit,Butterfly")
     .split(",")
     .map((s) => s.trim()),
 
-  // Price window (USD)
   MIN_PRICE_USD: parseFloat(process.env.MIN_PRICE_USD) || 50,
   MAX_PRICE_USD: parseFloat(process.env.MAX_PRICE_USD) || 5000,
 
-  // ── Price source ──────────────────────────────────────────────────────────
   // "csfloat_base"       → use listing.reference.base_price from CSFloat payload
-  //                        (no Steam calls at all — instant, no rate-limit risk)
   // "steam_max_buy_order"→ Steam histogram highest_buy_order
   // "steam_min_listing"  → Steam priceoverview lowest_price
   PRICE_SOURCE: (process.env.PRICE_SOURCE || "csfloat_base").trim(),
 
-  // How many top results to display / send to Telegram
   TOP_N: Math.min(20, Math.max(1, parseInt(process.env.TOP_N) || 10)),
 
-  // CSFloat pages per scan (100 listings/page, max 10)
+  // CSFloat pages per scan (50 listings/page, max 10)
   SCAN_PAGES: Math.min(10, Math.max(1, parseInt(process.env.SCAN_PAGES) || 3)),
 
-  // Minimum spread to include in results (USD). Negative = show underwater items too.
   MIN_SPREAD_USD: parseFloat(process.env.MIN_SPREAD_USD) || 0,
 
-  // Repeat scan every N seconds. 0 = run once and exit.
   POLL_INTERVAL_SECONDS: parseInt(process.env.POLL_INTERVAL_SECONDS) || 0,
 
-  // ── Steam settings (only relevant when PRICE_SOURCE != "csfloat_base") ────
   STEAM_REQUEST_DELAY_MS:   Math.max(500, parseInt(process.env.STEAM_REQUEST_DELAY_MS)   || 1500),
   STEAM_CACHE_TTL_SECONDS:  Math.max(60,  parseInt(process.env.STEAM_CACHE_TTL_SECONDS)  || 600),
 
-  // CSFloat backoff on 429: 5 min → 10 min → 30 min
   CSFLOAT_BACKOFF_STEPS_MS: [
     5  * 60 * 1000,
     10 * 60 * 1000,
     30 * 60 * 1000,
   ],
 
-  // Telegram (optional)
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || "",
   TELEGRAM_CHAT_ID:   process.env.TELEGRAM_CHAT_ID   || "",
 
   DEBUG: process.env.DEBUG === "true",
 };
 
-// Derived — cents
 const MIN_PRICE_CENTS = Math.round(CONFIG.MIN_PRICE_USD * 100);
 const MAX_PRICE_CENTS = Math.round(CONFIG.MAX_PRICE_USD * 100);
 
-// Validate PRICE_SOURCE
 const VALID_SOURCES = ["csfloat_base", "steam_max_buy_order", "steam_min_listing"];
 if (!VALID_SOURCES.includes(CONFIG.PRICE_SOURCE)) {
   console.error(
@@ -75,13 +63,11 @@ const USE_STEAM = CONFIG.PRICE_SOURCE !== "csfloat_base";
 // ─────────────────────────────────────────────────────────────────────────────
 let scanCount = 0;
 
-// CSFloat rate-limit
 let csfloatBackoffUntil = 0;
 let csfloatBackoffLevel = 0;
 
-// Steam caches (only used when USE_STEAM = true)
-const steamNameidCache = new Map();  // market_hash_name → nameid (permanent in-process)
-const steamPriceCache  = new Map();  // "name:mode" → { cents, ts }
+const steamNameidCache = new Map();
+const steamPriceCache  = new Map();
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  HTTP POOLS
@@ -94,13 +80,14 @@ const csfloatPool = new Pool("https://csfloat.com", {
   connect: { rejectUnauthorized: true },
 });
 
-// Steam pool — created only when needed
+// FIX: maxRedirections: 5 makes undici follow Steam's 302 redirects automatically
 const steamPool = USE_STEAM
   ? new Pool("https://steamcommunity.com", {
       connections: 2,
       pipelining:  1,
       keepAliveTimeout:    30_000,
       keepAliveMaxTimeout: 60_000,
+      maxRedirections:     5,
       connect: { rejectUnauthorized: true },
     })
   : null;
@@ -136,7 +123,6 @@ function log(...args) {
   console.log("[" + new Date().toISOString() + "]", ...args);
 }
 
-/** Human-readable label for the configured price source. */
 function sourceLabel() {
   return {
     csfloat_base:        "CSFloat Base Price",
@@ -197,9 +183,9 @@ async function fetchPage(page) {
     type:      "buy_now",
     min_price: String(MIN_PRICE_CENTS),
     max_price: String(MAX_PRICE_CENTS),
-    limit:     "50", // max allowed by CSFloat
+    limit:     "50",
     page:      String(page),
-    category:  "2",   // Knives
+    category:  "2",
   });
   const data = await csfloatRequest("/api/v1/listings?" + qs.toString());
   return data?.data || [];
@@ -208,14 +194,6 @@ async function fetchPage(page) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  CSFLOAT BASE PRICE HELPER
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Extracts the CSFloat reference/base price from a listing in cents.
- * CSFloat returns reference.base_price (median market) and
- * reference.suggested_price (their own suggested price).
- * We prefer base_price; fall back to suggested_price.
- * Returns null if neither is available.
- */
 function getCsfloatBasePrice(listing) {
   const ref = listing.reference;
   if (!ref) return null;
@@ -232,7 +210,7 @@ async function steamGet(path) {
     path,
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-      Accept:       "application/json, */*",
+      Accept:       "application/json, text/html, */*",
     },
   });
 
@@ -249,7 +227,6 @@ async function steamGet(path) {
   return text;
 }
 
-/** Resolves and caches the Steam Market nameid for an item. Permanent cache. */
 async function getSteamNameid(name) {
   if (steamNameidCache.has(name)) return steamNameidCache.get(name);
 
@@ -261,7 +238,7 @@ async function getSteamNameid(name) {
 
   const match = html.match(/Market_LoadOrderSpread\(\s*(\d+)\s*\)/);
   if (!match) {
-    log("  [Steam] Could not extract nameid for:", name);
+    if (CONFIG.DEBUG) log("  [Steam] Could not extract nameid for:", name);
     return null;
   }
 
@@ -269,10 +246,6 @@ async function getSteamNameid(name) {
   return match[1];
 }
 
-/**
- * Steam max buy order (histogram API).
- * Steam returns highest_buy_order in cents already.
- */
 async function getSteamMaxBuyOrder(name) {
   const key    = name + ":max_buy_order";
   const cached = steamPriceCache.get(key);
@@ -304,10 +277,6 @@ async function getSteamMaxBuyOrder(name) {
   return cents || null;
 }
 
-/**
- * Steam min listing price (priceoverview API).
- * Returns lowest listed price in cents.
- */
 async function getSteamMinListing(name) {
   const key    = name + ":min_listing";
   const cached = steamPriceCache.get(key);
@@ -329,7 +298,6 @@ async function getSteamMinListing(name) {
   try { data = JSON.parse(text); } catch { return null; }
   if (!data?.success) return null;
 
-  // lowest_price is a formatted string like "$123.45"
   const raw    = data.lowest_price;
   const parsed = raw ? parseFloat(String(raw).replace(/[^0-9.]/g, "")) : NaN;
   if (isNaN(parsed)) return null;
@@ -339,11 +307,10 @@ async function getSteamMinListing(name) {
   return cents || null;
 }
 
-/** Unified Steam price fetch — dispatches to the configured mode. */
 async function getSteamPrice(name) {
   if (CONFIG.PRICE_SOURCE === "steam_max_buy_order") return getSteamMaxBuyOrder(name);
   if (CONFIG.PRICE_SOURCE === "steam_min_listing")   return getSteamMinListing(name);
-  return null; // should never reach — csfloat_base bypasses this entirely
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -389,7 +356,6 @@ function buildConsoleReport(results, scanMs) {
   const W = 115;
   const div = "─".repeat(W);
 
-  // Dynamic header for the comparison price column
   const refColHeader = {
     csfloat_base:        "BASE PRICE",
     steam_max_buy_order: "STEAM MAX BO",
@@ -483,7 +449,7 @@ async function scan() {
       const page = await fetchPage(p);
       if (!page || page.length === 0) { log(`  [CSFloat] Page ${p + 1} empty — stopping`); break; }
       allListings.push(...page);
-      if (page.length < 100) break;
+      if (page.length < 50) break;
     } catch (err) {
       log(`  [CSFloat] Page ${p + 1} error: ${err.message}`);
       break;
@@ -501,47 +467,38 @@ async function scan() {
     return;
   }
 
-  // ── 3. Dedup — cheapest listing per market_hash_name ──────────────────────
-  //   Reduces Steam API calls.
-  //   For csfloat_base: each listing already carries its own reference price,
-  //   so we still dedup to avoid surfacing the same skin multiple times.
-  const cheapestByName = new Map();
-  for (const l of knifeListings) {
-    const name = l.item?.market_hash_name || "";
-    if (!name) continue;
-    const ex = cheapestByName.get(name);
-    if (!ex || l.price < ex.price) cheapestByName.set(name, l);
-  }
-  log(`  [Dedup]   Unique skins: ${cheapestByName.size}`);
-
-  // ── 4. Resolve comparison price ───────────────────────────────────────────
-  const results  = [];
-  const entries  = [...cheapestByName.entries()];
+  // ── 3. Resolve comparison price ───────────────────────────────────────────
+  const results = [];
   let hits = 0, misses = 0;
 
   if (!USE_STEAM) {
-    // ── csfloat_base: reference price is already in the payload ──────────────
-    log(`  [CSFloat] Resolving base prices from payload...`);
-    for (const [name, listing] of entries) {
+    // ── csfloat_base: base price is in the payload — evaluate ALL listings ────
+    log(`  [CSFloat] Resolving base prices from payload (${knifeListings.length} listings)...`);
+
+    for (const listing of knifeListings) {
+      const name         = listing.item?.market_hash_name || "";
       const baseCents    = getCsfloatBasePrice(listing);
       const csfloatCents = listing.price;
 
-      process.stdout.write(
-        `  [Base] ${(name).slice(0, 60).padEnd(60)} ` +
-        `→ ask: ${fmt(csfloatCents).padStart(9)}  base: `
-      );
+      if (CONFIG.DEBUG) {
+        process.stdout.write(
+          `  [Base] ${name.slice(0, 60).padEnd(60)} ` +
+          `→ ask: ${fmt(csfloatCents).padStart(9)}  base: `
+        );
+      }
 
       if (baseCents == null) {
-        process.stdout.write("no ref data\n");
+        if (CONFIG.DEBUG) process.stdout.write("no ref data\n");
         misses++;
         continue;
       }
 
       const spreadCents = baseCents - csfloatCents;
       const spreadPct   = (spreadCents / csfloatCents) * 100;
-      process.stdout.write(
-        `${fmt(baseCents).padStart(9)}  spread: ${fmtSign(spreadCents)}\n`
-      );
+
+      if (CONFIG.DEBUG) {
+        process.stdout.write(`${fmt(baseCents).padStart(9)}  spread: ${fmtSign(spreadCents)}\n`);
+      }
       hits++;
 
       if (spreadCents / 100 >= CONFIG.MIN_SPREAD_USD) {
@@ -557,34 +514,61 @@ async function scan() {
         });
       }
     }
-    log(`\n  [Base]  Resolved: ${hits}, Missing ref: ${misses}`);
+    log(`  [Base]  Evaluated: ${knifeListings.length}, Resolved: ${hits}, Missing ref: ${misses}`);
 
   } else {
-    // ── steam_max_buy_order or steam_min_listing: sequential Steam requests ───
-    log(`  [Steam]  Fetching ${sourceLabel()} for ${entries.length} item(s)...`);
+    // ── Steam: fetch price per unique skin name, then apply to ALL listings ───
+    //
+    // Step A: collect unique skin names to minimise Steam API calls
+    // Step B: fetch one Steam price per unique name (with delay + cache)
+    // Step C: evaluate every individual listing — not just cheapest-per-name
+    //
+    const uniqueNames = [...new Set(
+      knifeListings.map((l) => l.item?.market_hash_name).filter(Boolean)
+    )];
+
+    log(`  [Steam]  Fetching ${sourceLabel()} for ${uniqueNames.length} unique skin(s)` +
+        ` covering ${knifeListings.length} total listings...`);
     log(`  [Steam]  Delay: ${CONFIG.STEAM_REQUEST_DELAY_MS}ms | Cache TTL: ${CONFIG.STEAM_CACHE_TTL_SECONDS}s`);
 
-    for (let i = 0; i < entries.length; i++) {
-      const [name, listing] = entries[i];
+    // Step A+B — build name → refCents map
+    const refPriceMap = new Map();
+    for (let i = 0; i < uniqueNames.length; i++) {
+      const name = uniqueNames[i];
       process.stdout.write(
-        `  [Steam] ${i + 1}/${entries.length} — ${name.slice(0, 55).padEnd(55)} `
+        `  [Steam] ${i + 1}/${uniqueNames.length} — ${name.slice(0, 55).padEnd(55)} `
       );
-
       const refCents = await getSteamPrice(name);
       if (refCents == null) {
         process.stdout.write("→ no data\n");
-        misses++;
-        continue;
+      } else {
+        process.stdout.write(`→ ${fmt(refCents)}\n`);
+        refPriceMap.set(name, refCents);
       }
+    }
+
+    log(`  [Steam]  Prices resolved for ${refPriceMap.size}/${uniqueNames.length} unique skins`);
+    log(`  [Steam]  Evaluating all ${knifeListings.length} individual listings...`);
+
+    // Step C — score every listing individually
+    for (const listing of knifeListings) {
+      const name = listing.item?.market_hash_name || "";
+      if (!name) continue;
+
+      const refCents = refPriceMap.get(name);
+      if (refCents == null) { misses++; continue; }
 
       const csfloatCents = listing.price;
       const spreadCents  = refCents - csfloatCents;
       const spreadPct    = (spreadCents / csfloatCents) * 100;
-
-      process.stdout.write(
-        `→ ask: ${fmt(csfloatCents).padStart(9)}  ref: ${fmt(refCents).padStart(9)}  spread: ${fmtSign(spreadCents)}\n`
-      );
       hits++;
+
+      if (CONFIG.DEBUG) {
+        log(
+          `  [Eval] ${name.slice(0, 50).padEnd(50)}` +
+          ` ask: ${fmt(csfloatCents).padStart(9)}  ref: ${fmt(refCents).padStart(9)}  spread: ${fmtSign(spreadCents)}`
+        );
+      }
 
       if (spreadCents / 100 >= CONFIG.MIN_SPREAD_USD) {
         results.push({
@@ -599,15 +583,15 @@ async function scan() {
         });
       }
     }
-    log(`\n  [Steam]  Resolved: ${hits}, Missing: ${misses}`);
+    log(`  [Steam]  Hits: ${hits}, No-ref (skin price unavailable): ${misses}`);
   }
 
-  // ── 5. Sort and trim ───────────────────────────────────────────────────────
+  // ── 4. Sort and trim ───────────────────────────────────────────────────────
   results.sort((a, b) => b.spreadCents - a.spreadCents);
-  const top     = results.slice(0, CONFIG.TOP_N);
-  const scanMs  = Date.now() - scanStart;
+  const top    = results.slice(0, CONFIG.TOP_N);
+  const scanMs = Date.now() - scanStart;
 
-  // ── 6. Output ─────────────────────────────────────────────────────────────
+  // ── 5. Output ─────────────────────────────────────────────────────────────
   if (top.length > 0) {
     console.log(buildConsoleReport(top, scanMs));
     sendTelegram(buildTelegramReport(top, scanMs)).catch(() => {});
@@ -637,7 +621,7 @@ async function main() {
   } else {
     console.log(`  Steam:         skipped (base price from CSFloat payload)`);
   }
-  console.log(`  Pages/scan:    ${CONFIG.SCAN_PAGES} (up to ${CONFIG.SCAN_PAGES * 100} listings)`);
+  console.log(`  Pages/scan:    ${CONFIG.SCAN_PAGES} (up to ${CONFIG.SCAN_PAGES * 50} listings)`);
   console.log(`  Top N:         ${CONFIG.TOP_N}`);
   console.log(`  Min spread:    $${CONFIG.MIN_SPREAD_USD}`);
   console.log(`  Poll interval: ${CONFIG.POLL_INTERVAL_SECONDS > 0 ? CONFIG.POLL_INTERVAL_SECONDS + "s" : "single run"}`);
