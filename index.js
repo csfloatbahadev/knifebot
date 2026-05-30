@@ -8,9 +8,12 @@ const { Pool } = require("undici");
 const CONFIG = {
   CSFLOAT_API_KEY: process.env.CSFLOAT_API_KEY,
 
-  KNIFE_FAMILIES: (process.env.KNIFE_FAMILIES || "Talon,Karambit,Butterfly")
+  // Knife family substrings to match against market_hash_name (client-side filter)
+  // e.g. "Talon,Karambit,Butterfly" or leave empty to get ALL knives
+  KNIFE_FAMILIES: (process.env.KNIFE_FAMILIES || "")
     .split(",")
-    .map((s) => s.trim()),
+    .map((s) => s.trim())
+    .filter(Boolean),
 
   MIN_PRICE_USD: parseFloat(process.env.MIN_PRICE_USD) || 50,
   MAX_PRICE_USD: parseFloat(process.env.MAX_PRICE_USD) || 5000,
@@ -22,17 +25,28 @@ const CONFIG = {
 
   TOP_N: Math.min(20, Math.max(1, parseInt(process.env.TOP_N) || 10)),
 
-  // CSFloat pages per scan (50 listings/page, max 10)
+  // How many pages to fetch per scan. Each page = 50 listings.
+  // CSFloat enforces a minimum 20s delay between listing requests —
+  // so 3 pages takes at least 40s to fetch.
   SCAN_PAGES: Math.min(10, Math.max(1, parseInt(process.env.SCAN_PAGES) || 3)),
 
+  // Minimum profit (USD) to include a listing in results.
+  //   spread = reference_price - csfloat_ask
+  //   e.g. MIN_SPREAD_USD=100 → only show listings where you'd profit $100+
+  //   e.g. MIN_SPREAD_USD=0   → show all listings with any positive spread
+  //   e.g. MIN_SPREAD_USD=-50 → also show slightly underwater listings
   MIN_SPREAD_USD: parseFloat(process.env.MIN_SPREAD_USD) || 0,
 
-  // 0 = run once and exit. Set to e.g. 120 to poll every 2 minutes.
+  // 0 = run once and exit. Set to e.g. 300 to rescan every 5 minutes.
   POLL_INTERVAL_SECONDS: parseInt(process.env.POLL_INTERVAL_SECONDS) || 0,
 
-  STEAM_REQUEST_DELAY_MS:   Math.max(500, parseInt(process.env.STEAM_REQUEST_DELAY_MS)   || 1500),
-  STEAM_CACHE_TTL_SECONDS:  Math.max(60,  parseInt(process.env.STEAM_CACHE_TTL_SECONDS)  || 600),
+  // Minimum delay between CSFloat listing page requests (API enforces ~20s)
+  CSFLOAT_PAGE_DELAY_MS: Math.max(20000, parseInt(process.env.CSFLOAT_PAGE_DELAY_MS) || 20000),
 
+  STEAM_REQUEST_DELAY_MS:  Math.max(500, parseInt(process.env.STEAM_REQUEST_DELAY_MS)  || 1500),
+  STEAM_CACHE_TTL_SECONDS: Math.max(60,  parseInt(process.env.STEAM_CACHE_TTL_SECONDS) || 600),
+
+  // CSFloat backoff on 429: 5 min → 10 min → 30 min
   CSFLOAT_BACKOFF_STEPS_MS: [
     5  * 60 * 1000,
     10 * 60 * 1000,
@@ -80,7 +94,6 @@ const csfloatPool = new Pool("https://csfloat.com", {
   connect: { rejectUnauthorized: true },
 });
 
-// FIX: maxRedirections follows Steam's 302 redirects automatically
 const steamPool = USE_STEAM
   ? new Pool("https://steamcommunity.com", {
       connections: 2,
@@ -154,7 +167,8 @@ async function csfloatRequest(path) {
 
   const text = await body.text();
 
-  if (statusCode === 429) {
+  if (statusCode === 429 || statusCode === 409) {
+    // 429 = explicit rate limit; 409 = conflict / too-fast pagination
     csfloatBackoffLevel = Math.min(
       csfloatBackoffLevel + 1,
       CONFIG.CSFLOAT_BACKOFF_STEPS_MS.length - 1
@@ -162,9 +176,9 @@ async function csfloatRequest(path) {
     const delay = CONFIG.CSFLOAT_BACKOFF_STEPS_MS[csfloatBackoffLevel];
     csfloatBackoffUntil = Date.now() + delay;
     const mins = (delay / 60000).toFixed(0);
-    log(`  [CSFloat] ⚠️  429 — cooling down for ${mins} min (level ${csfloatBackoffLevel})`);
+    log(`  [CSFloat] ⚠️  ${statusCode} — cooling down for ${mins} min (level ${csfloatBackoffLevel})`);
     sendTelegram(
-      `⏳ <b>CSFloat Rate Limited</b>\nLevel ${csfloatBackoffLevel} — cooling for <b>${mins} min</b>`
+      `⏳ <b>CSFloat Rate Limited (${statusCode})</b>\nLevel ${csfloatBackoffLevel} — cooling for <b>${mins} min</b>`
     ).catch(() => {});
     return null;
   }
@@ -178,38 +192,43 @@ async function csfloatRequest(path) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  CSFLOAT PAGINATION — cursor-based (per official API docs)
+//  CSFLOAT PAGINATION
 //
-//  The API does NOT have a "page" parameter. Pagination works via an opaque
-//  "cursor" string returned in each response. Pass the cursor from the
-//  previous page to get the next batch of 50 listings.
+//  CSFloat uses cursor-based pagination.
+//  - First page: no cursor param
+//  - Subsequent pages: pass cursor=<last_listing_id_from_previous_page>
+//  - Rate limit: minimum 20 seconds between requests (409 if too fast)
+//
+//  Knife filtering is done via rarity=6 (Covert = knives/gloves) server-side,
+//  then client-side by KNIFE_FAMILIES substring match.
+//  The market_hash_name param only accepts exact full names, not partials.
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchPage(cursor) {
-  // FIX: category param corrected:
-  //   0 = any, 1 = normal, 2 = stattrak, 3 = souvenir
-  // We used to pass category=2 thinking it meant "knives" — it means StatTrak.
-  // Knives have no dedicated category filter; we filter by name client-side.
-  // Using category=0 (any) to catch all knife listings regardless of StatTrak status.
   const params = {
     sort_by:   "highest_discount",
     type:      "buy_now",
     min_price: String(MIN_PRICE_CENTS),
     max_price: String(MAX_PRICE_CENTS),
     limit:     "50",
-    category:  "0",   // 0 = any (knives are NOT category 2 — that's StatTrak)
+    // rarity=6 = Covert quality (★ knives and gloves) — narrows results server-side
+    // so we're not paginating through thousands of rifle skins to find knives
+    rarity:    "6",
+    // category=0 = any (normal + stattrak + souvenir)
+    // category=1 = normal only, category=2 = stattrak only
+    // Leaving as 0 to catch both normal and StatTrak knives
+    category:  "0",
   };
 
-  // FIX: cursor-based pagination — pass cursor from previous response, not a page number
   if (cursor) params.cursor = cursor;
 
   const qs   = new URLSearchParams(params);
   const data = await csfloatRequest("/api/v1/listings?" + qs.toString());
   if (!data) return { listings: [], cursor: null };
 
-  // The API returns an array at the top level.
-  // The next-page cursor is in the last listing's "id" — CSFloat uses keyset pagination
-  // where you pass the last seen id as the cursor.
+  // API returns a top-level array of listing objects
   const listings = Array.isArray(data) ? data : (data.data || []);
+
+  // Cursor for next page = the id of the last listing in this batch
   const nextCursor = listings.length === 50 ? listings[listings.length - 1].id : null;
 
   return { listings, cursor: nextCursor };
@@ -338,10 +357,15 @@ async function getSteamPrice(name) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  KNIFE FILTER
+//  KNIFE FILTER (client-side)
+//
+//  rarity=6 from the API already gives us knives+gloves.
+//  If KNIFE_FAMILIES is set, we further narrow by substring match.
+//  If KNIFE_FAMILIES is empty, all rarity-6 items are included.
 // ─────────────────────────────────────────────────────────────────────────────
 function isTargetKnife(listing) {
   const name = (listing.item?.market_hash_name || "").toLowerCase();
+  if (CONFIG.KNIFE_FAMILIES.length === 0) return true;
   return CONFIG.KNIFE_FAMILIES.some((f) => name.includes(f.toLowerCase()));
 }
 
@@ -429,7 +453,7 @@ function buildTelegramReport(results, scanMs) {
 
   let msg =
     `🗡️ <b>Knife Arb — Top ${results.length}</b>\n` +
-    `<i>${h(CONFIG.KNIFE_FAMILIES.join(", "))}  |  ${h(srcShort)}  |  ${(scanMs / 1000).toFixed(1)}s</i>\n\n`;
+    `<i>${h(CONFIG.KNIFE_FAMILIES.join(", ") || "all knives")}  |  ${h(srcShort)}  |  ${(scanMs / 1000).toFixed(1)}s</i>\n\n`;
 
   for (let i = 0; i < results.length; i++) {
     const r          = results[i];
@@ -465,12 +489,13 @@ async function scan() {
   const scanStart = Date.now();
   log(`\n══ SCAN #${scanCount}  [${CONFIG.PRICE_SOURCE}] ${"═".repeat(30)}`);
 
-  // ── 1. Fetch CSFloat pages (cursor-based pagination) ───────────────────────
+  // ── 1. Fetch CSFloat pages ─────────────────────────────────────────────────
   const allListings = [];
   let cursor = null;
 
   for (let p = 0; p < CONFIG.SCAN_PAGES; p++) {
     log(`  [CSFloat] Page ${p + 1}/${CONFIG.SCAN_PAGES}${cursor ? " (cursor)" : ""}...`);
+
     try {
       const result = await fetchPage(cursor);
       const { listings, cursor: nextCursor } = result;
@@ -485,7 +510,7 @@ async function scan() {
 
       cursor = nextCursor;
       if (!cursor) {
-        log(`  [CSFloat] No more pages available`);
+        log(`  [CSFloat] No more pages`);
         break;
       }
     } catch (err) {
@@ -493,7 +518,11 @@ async function scan() {
       break;
     }
 
-    if (p < CONFIG.SCAN_PAGES - 1) await sleep(500);
+    // Must wait at least 20s between CSFloat listing requests
+    if (p < CONFIG.SCAN_PAGES - 1 && cursor) {
+      log(`  [CSFloat] Waiting ${CONFIG.CSFLOAT_PAGE_DELAY_MS / 1000}s before next page (rate limit)...`);
+      await sleep(CONFIG.CSFLOAT_PAGE_DELAY_MS);
+    }
   }
 
   log(`  [CSFloat] Fetched ${allListings.length} listings total`);
@@ -503,7 +532,7 @@ async function scan() {
   log(`  [Filter]  Matching knives: ${knifeListings.length}`);
 
   if (knifeListings.length === 0) {
-    log("  No matching knife listings found. Try widening price range or adding KNIFE_FAMILIES.");
+    log("  No matching listings. Check KNIFE_FAMILIES or widen price range.");
     return;
   }
 
@@ -512,8 +541,7 @@ async function scan() {
   let hits = 0, misses = 0;
 
   if (!USE_STEAM) {
-    // ── csfloat_base: base price is in the payload — evaluate ALL listings ────
-    log(`  [CSFloat] Resolving base prices from payload (${knifeListings.length} listings)...`);
+    log(`  [CSFloat] Resolving base prices (${knifeListings.length} listings)...`);
 
     for (const listing of knifeListings) {
       const name         = listing.item?.market_hash_name || "";
@@ -522,8 +550,7 @@ async function scan() {
 
       if (CONFIG.DEBUG) {
         process.stdout.write(
-          `  [Base] ${name.slice(0, 60).padEnd(60)} ` +
-          `→ ask: ${fmt(csfloatCents).padStart(9)}  base: `
+          `  [Base] ${name.slice(0, 60).padEnd(60)} → ask: ${fmt(csfloatCents).padStart(9)}  base: `
         );
       }
 
@@ -557,13 +584,11 @@ async function scan() {
     log(`  [Base]  Evaluated: ${knifeListings.length}, Resolved: ${hits}, Missing ref: ${misses}`);
 
   } else {
-    // ── Steam: fetch price per unique skin name, then score ALL listings ──────
     const uniqueNames = [...new Set(
       knifeListings.map((l) => l.item?.market_hash_name).filter(Boolean)
     )];
 
-    log(`  [Steam]  Fetching ${sourceLabel()} for ${uniqueNames.length} unique skin(s)` +
-        ` covering ${knifeListings.length} total listings...`);
+    log(`  [Steam]  Fetching ${sourceLabel()} for ${uniqueNames.length} unique skin(s) (${knifeListings.length} total listings)...`);
     log(`  [Steam]  Delay: ${CONFIG.STEAM_REQUEST_DELAY_MS}ms | Cache TTL: ${CONFIG.STEAM_CACHE_TTL_SECONDS}s`);
 
     const refPriceMap = new Map();
@@ -582,7 +607,6 @@ async function scan() {
     }
 
     log(`  [Steam]  Prices resolved for ${refPriceMap.size}/${uniqueNames.length} unique skins`);
-    log(`  [Steam]  Evaluating all ${knifeListings.length} individual listings...`);
 
     for (const listing of knifeListings) {
       const name = listing.item?.market_hash_name || "";
@@ -616,7 +640,7 @@ async function scan() {
         });
       }
     }
-    log(`  [Steam]  Hits: ${hits}, No-ref (skin price unavailable): ${misses}`);
+    log(`  [Steam]  Hits: ${hits}, No-ref: ${misses}`);
   }
 
   // ── 4. Sort and trim ───────────────────────────────────────────────────────
@@ -629,7 +653,7 @@ async function scan() {
     console.log(buildConsoleReport(top, scanMs));
     sendTelegram(buildTelegramReport(top, scanMs)).catch(() => {});
   } else {
-    log(`  No results above MIN_SPREAD_USD=${CONFIG.MIN_SPREAD_USD}`);
+    log(`  No results above MIN_SPREAD_USD=$${CONFIG.MIN_SPREAD_USD}`);
   }
 }
 
@@ -642,10 +666,14 @@ async function main() {
     process.exit(1);
   }
 
+  const familyLabel = CONFIG.KNIFE_FAMILIES.length > 0
+    ? CONFIG.KNIFE_FAMILIES.join(", ")
+    : "all knives (rarity=6)";
+
   console.log("╔══════════════════════════════════════════════════════╗");
   console.log("║           🗡️  KNIFE ARBITRAGE SCANNER                ║");
   console.log("╚══════════════════════════════════════════════════════╝");
-  console.log(`  Families:      ${CONFIG.KNIFE_FAMILIES.join(", ")}`);
+  console.log(`  Families:      ${familyLabel}`);
   console.log(`  Price range:   $${CONFIG.MIN_PRICE_USD} – $${CONFIG.MAX_PRICE_USD}`);
   console.log(`  Price source:  ${sourceLabel()}`);
   if (USE_STEAM) {
@@ -654,9 +682,10 @@ async function main() {
   } else {
     console.log(`  Steam:         skipped (base price from CSFloat payload)`);
   }
-  console.log(`  Pages/scan:    ${CONFIG.SCAN_PAGES} (up to ${CONFIG.SCAN_PAGES * 50} listings)`);
+  console.log(`  Pages/scan:    ${CONFIG.SCAN_PAGES} × 50 = up to ${CONFIG.SCAN_PAGES * 50} listings`);
+  console.log(`  Page delay:    ${CONFIG.CSFLOAT_PAGE_DELAY_MS / 1000}s (CSFloat rate limit)`);
   console.log(`  Top N:         ${CONFIG.TOP_N}`);
-  console.log(`  Min spread:    $${CONFIG.MIN_SPREAD_USD}`);
+  console.log(`  Min spread:    $${CONFIG.MIN_SPREAD_USD}  ← only show deals with profit >= this`);
   console.log(`  Poll interval: ${CONFIG.POLL_INTERVAL_SECONDS > 0 ? CONFIG.POLL_INTERVAL_SECONDS + "s" : "single run (set POLL_INTERVAL_SECONDS>0 to loop)"}`);
   console.log(`  Telegram:      ${CONFIG.TELEGRAM_BOT_TOKEN ? "active (chat " + CONFIG.TELEGRAM_CHAT_ID + ")" : "disabled"}`);
   console.log("");
@@ -667,7 +696,7 @@ async function main() {
     log(`\n  Polling every ${CONFIG.POLL_INTERVAL_SECONDS}s. Ctrl+C to stop.`);
     setInterval(scan, CONFIG.POLL_INTERVAL_SECONDS * 1000);
   } else {
-    log("  Single-run complete. Set POLL_INTERVAL_SECONDS>0 in .env to keep running.");
+    log("  Single-run complete. Set POLL_INTERVAL_SECONDS>0 to keep running.");
     process.exit(0);
   }
 }
