@@ -197,7 +197,7 @@ async function fetchPage(page) {
     type:      "buy_now",
     min_price: String(MIN_PRICE_CENTS),
     max_price: String(MAX_PRICE_CENTS),
-    limit:     "100",
+    limit:     "50", // max allowed by CSFloat
     page:      String(page),
     category:  "2",   // Knives
   });
