@@ -3,17 +3,95 @@ require("dotenv").config();
 const { Pool } = require("undici");
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  STATIC KNIFE NAME LIST
+//  Generates every combination of (knife type) × (skin) × (wear) × (stattrak?)
+//  for Karambit and Talon Knife.
+//  CSFloat will simply return 0 listings for combinations that don't exist
+//  in-game — no error handling needed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const WEARS = [
+  "Factory New",
+  "Minimal Wear",
+  "Field-Tested",
+  "Well-Worn",
+  "Battle-Scarred",
+];
+
+// Skins that only come in specific wears.
+// If a skin isn't listed here it gets all 5 wears.
+const WEAR_OVERRIDE = {
+  "Doppler":       ["Factory New", "Minimal Wear"],
+  "Gamma Doppler": ["Factory New", "Minimal Wear"],
+  "Marble Fade":   ["Factory New"],
+  "Tiger Tooth":   ["Factory New"],
+  "Fade":          ["Factory New", "Minimal Wear"],
+  "Bright Water":  ["Factory New", "Minimal Wear", "Field-Tested"],
+  "Slaughter":     ["Factory New", "Minimal Wear", "Field-Tested"],
+  "Night":         ["Factory New", "Minimal Wear", "Field-Tested"],
+  "Rust Coat":     ["Battle-Scarred"],
+};
+
+// All skins available on both Karambit and Talon Knife.
+const SHARED_SKINS = [
+  "Doppler",
+  "Gamma Doppler",
+  "Marble Fade",
+  "Tiger Tooth",
+  "Fade",
+  "Slaughter",
+  "Crimson Web",
+  "Case Hardened",
+  "Black Laminate",
+  "Autotronic",
+  "Freehand",
+  "Bright Water",
+  "Ultraviolet",
+  "Night",
+  "Blue Steel",
+  "Stained",
+  "Damascus Steel",
+  "Urban Masked",
+  "Scorched",
+  "Forest DDPAT",
+  "Boreal Forest",
+  "Rust Coat",
+];
+
+// Skins exclusive to Karambit (added before Talon existed)
+const KARAMBIT_ONLY_SKINS = [
+  "Lore",
+];
+
+function buildNames(knifeBase, skins) {
+  const names = [];
+
+  // Vanilla — no skin suffix, no wear
+  names.push(`★ ${knifeBase}`);
+  names.push(`★ StatTrak™ ${knifeBase}`);
+
+  for (const skin of skins) {
+    const wears = WEAR_OVERRIDE[skin] ?? WEARS;
+    for (const wear of wears) {
+      names.push(`★ ${knifeBase} | ${skin} (${wear})`);
+      names.push(`★ StatTrak™ ${knifeBase} | ${skin} (${wear})`);
+    }
+  }
+
+  return names;
+}
+
+const KARAMBIT_NAMES = buildNames("Karambit", [...SHARED_SKINS, ...KARAMBIT_ONLY_SKINS]);
+const TALON_NAMES    = buildNames("Talon Knife", SHARED_SKINS);
+
+// Master list — deduplicated, alphabetically sorted for predictable scan order
+const ALL_KNIFE_NAMES = [...new Set([...KARAMBIT_NAMES, ...TALON_NAMES])].sort();
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
 const CONFIG = {
   CSFLOAT_API_KEY: process.env.CSFLOAT_API_KEY,
-
-  // Knife family substrings to match against market_hash_name (client-side filter)
-  // e.g. "Talon,Karambit,Butterfly" or leave empty to get ALL knives
-  KNIFE_FAMILIES: (process.env.KNIFE_FAMILIES || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean),
 
   MIN_PRICE_USD: parseFloat(process.env.MIN_PRICE_USD) || 50,
   MAX_PRICE_USD: parseFloat(process.env.MAX_PRICE_USD) || 5000,
@@ -23,28 +101,22 @@ const CONFIG = {
   // "steam_min_listing"  → Steam priceoverview lowest_price
   PRICE_SOURCE: (process.env.PRICE_SOURCE || "csfloat_base").trim(),
 
-  TOP_N: Math.min(20, Math.max(1, parseInt(process.env.TOP_N) || 10)),
+  TOP_N: Math.min(50, Math.max(1, parseInt(process.env.TOP_N) || 10)),
 
-  // How many pages to fetch per scan. Each page = 50 listings.
-  // CSFloat enforces a minimum 20s delay between listing requests —
-  // so 3 pages takes at least 40s to fetch.
-  SCAN_PAGES: Math.min(10, Math.max(1, parseInt(process.env.SCAN_PAGES) || 3)),
+  // How many listings to fetch per knife name (max 50 per CSFloat page).
+  LISTINGS_PER_NAME: Math.min(50, Math.max(1, parseInt(process.env.LISTINGS_PER_NAME) || 10)),
 
   // Minimum profit (USD) to include a listing in results.
-  //   spread = reference_price - csfloat_ask
-  //   e.g. MIN_SPREAD_USD=100 → only show listings where you'd profit $100+
-  //   e.g. MIN_SPREAD_USD=0   → show all listings with any positive spread
-  //   e.g. MIN_SPREAD_USD=-50 → also show slightly underwater listings
   MIN_SPREAD_USD: parseFloat(process.env.MIN_SPREAD_USD) || 0,
 
   // 0 = run once and exit. Set to e.g. 300 to rescan every 5 minutes.
   POLL_INTERVAL_SECONDS: parseInt(process.env.POLL_INTERVAL_SECONDS) || 0,
 
-  // Minimum delay between CSFloat listing page requests (API enforces ~20s)
-  CSFLOAT_PAGE_DELAY_MS: Math.max(20000, parseInt(process.env.CSFLOAT_PAGE_DELAY_MS) || 20000),
+  // Delay between each per-name CSFloat request (API enforces ~20s)
+  CSFLOAT_NAME_DELAY_MS: Math.max(20000, parseInt(process.env.CSFLOAT_NAME_DELAY_MS) || 20000),
 
-  STEAM_REQUEST_DELAY_MS:  Math.max(500, parseInt(process.env.STEAM_REQUEST_DELAY_MS)  || 1500),
-  STEAM_CACHE_TTL_SECONDS: Math.max(60,  parseInt(process.env.STEAM_CACHE_TTL_SECONDS) || 600),
+  STEAM_REQUEST_DELAY_MS:  Math.max(500,  parseInt(process.env.STEAM_REQUEST_DELAY_MS)  || 1500),
+  STEAM_CACHE_TTL_SECONDS: Math.max(60,   parseInt(process.env.STEAM_CACHE_TTL_SECONDS) || 600),
 
   // CSFloat backoff on 429: 5 min → 10 min → 30 min
   CSFLOAT_BACKOFF_STEPS_MS: [
@@ -168,7 +240,6 @@ async function csfloatRequest(path) {
   const text = await body.text();
 
   if (statusCode === 429 || statusCode === 409) {
-    // 429 = explicit rate limit; 409 = conflict / too-fast pagination
     csfloatBackoffLevel = Math.min(
       csfloatBackoffLevel + 1,
       CONFIG.CSFLOAT_BACKOFF_STEPS_MS.length - 1
@@ -192,46 +263,34 @@ async function csfloatRequest(path) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  CSFLOAT PAGINATION
+//  FETCH LISTINGS FOR A SPECIFIC MARKET HASH NAME
 //
-//  CSFloat uses cursor-based pagination.
-//  - First page: no cursor param
-//  - Subsequent pages: pass cursor=<last_listing_id_from_previous_page>
-//  - Rate limit: minimum 20 seconds between requests (409 if too fast)
-//
-//  Knife filtering is done via rarity=6 (Covert = knives/gloves) server-side,
-//  then client-side by KNIFE_FAMILIES substring match.
-//  The market_hash_name param only accepts exact full names, not partials.
+//  Queries CSFloat for buy-now listings of an exact skin name.
+//  Returns the cheapest N listings sorted by price ascending.
+//  If CSFloat returns nothing (skin doesn't exist or no listings), returns [].
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchPage(cursor) {
-  const params = {
-    sort_by:   "highest_discount",
-    type:      "buy_now",
-    min_price: String(MIN_PRICE_CENTS),
-    max_price: String(MAX_PRICE_CENTS),
-    limit:     "50",
-    // rarity=6 = Covert quality (★ knives and gloves) — narrows results server-side
-    // so we're not paginating through thousands of rifle skins to find knives
-    rarity:    "6",
-    // category=0 = any (normal + stattrak + souvenir)
-    // category=1 = normal only, category=2 = stattrak only
-    // Leaving as 0 to catch both normal and StatTrak knives
-    category:  "0",
-  };
+async function fetchListingsForName(marketHashName) {
+  const params = new URLSearchParams({
+    market_hash_name: marketHashName,
+    type:             "buy_now",
+    sort_by:          "lowest_price",
+    min_price:        String(MIN_PRICE_CENTS),
+    max_price:        String(MAX_PRICE_CENTS),
+    limit:            String(CONFIG.LISTINGS_PER_NAME),
+  });
 
-  if (cursor) params.cursor = cursor;
+  let data;
+  try {
+    data = await csfloatRequest("/api/v1/listings?" + params.toString());
+  } catch (err) {
+    log(`  [CSFloat] Error fetching "${marketHashName}": ${err.message}`);
+    return [];
+  }
 
-  const qs   = new URLSearchParams(params);
-  const data = await csfloatRequest("/api/v1/listings?" + qs.toString());
-  if (!data) return { listings: [], cursor: null };
+  if (!data) return []; // rate-limited, backoff already applied
 
-  // API returns a top-level array of listing objects
   const listings = Array.isArray(data) ? data : (data.data || []);
-
-  // Cursor for next page = the id of the last listing in this batch
-  const nextCursor = listings.length === 50 ? listings[listings.length - 1].id : null;
-
-  return { listings, cursor: nextCursor };
+  return listings.filter((l) => l.type === "buy_now");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -357,19 +416,6 @@ async function getSteamPrice(name) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  KNIFE FILTER (client-side)
-//
-//  rarity=6 from the API already gives us knives+gloves.
-//  If KNIFE_FAMILIES is set, we further narrow by substring match.
-//  If KNIFE_FAMILIES is empty, all rarity-6 items are included.
-// ─────────────────────────────────────────────────────────────────────────────
-function isTargetKnife(listing) {
-  const name = (listing.item?.market_hash_name || "").toLowerCase();
-  if (CONFIG.KNIFE_FAMILIES.length === 0) return true;
-  return CONFIG.KNIFE_FAMILIES.some((f) => name.includes(f.toLowerCase()));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  TELEGRAM
 // ─────────────────────────────────────────────────────────────────────────────
 async function sendTelegram(text) {
@@ -453,7 +499,7 @@ function buildTelegramReport(results, scanMs) {
 
   let msg =
     `🗡️ <b>Knife Arb — Top ${results.length}</b>\n` +
-    `<i>${h(CONFIG.KNIFE_FAMILIES.join(", ") || "all knives")}  |  ${h(srcShort)}  |  ${(scanMs / 1000).toFixed(1)}s</i>\n\n`;
+    `<i>Karambit + Talon  |  ${h(srcShort)}  |  ${(scanMs / 1000).toFixed(1)}s</i>\n\n`;
 
   for (let i = 0; i < results.length; i++) {
     const r          = results[i];
@@ -476,7 +522,39 @@ function buildTelegramReport(results, scanMs) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  PROCESS ONE LISTING → RESULT OBJECT
+// ─────────────────────────────────────────────────────────────────────────────
+function makeResult(listing, refCents) {
+  const name         = listing.item?.market_hash_name || "";
+  const csfloatCents = listing.price;
+  const spreadCents  = refCents - csfloatCents;
+  const spreadPct    = (spreadCents / csfloatCents) * 100;
+
+  return {
+    name,
+    listingId:    listing.id,
+    csfloatCents,
+    refCents,
+    spreadCents,
+    spreadPct,
+    floatVal:     listing.item?.float_value ?? null,
+    wearName:     listing.item?.wear_name || "",
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  MAIN SCAN
+//
+//  Iterates over every knife name in ALL_KNIFE_NAMES.
+//  For each name:
+//    1. Fetch cheapest N listings from CSFloat
+//    2. Resolve the reference price (CSFloat base or Steam)
+//    3. Compute spread and collect qualifying results
+//    4. Wait CSFLOAT_NAME_DELAY_MS before the next name
+//
+//  Total scan time ≈ ALL_KNIFE_NAMES.length × 20s
+//  (~196 names × 20s ≈ 65 minutes for a full scan)
+//  Set POLL_INTERVAL_SECONDS accordingly (e.g. 3600 to re-scan hourly).
 // ─────────────────────────────────────────────────────────────────────────────
 async function scan() {
   if (Date.now() < csfloatBackoffUntil) {
@@ -487,168 +565,109 @@ async function scan() {
 
   scanCount++;
   const scanStart = Date.now();
-  log(`\n══ SCAN #${scanCount}  [${CONFIG.PRICE_SOURCE}] ${"═".repeat(30)}`);
+  log(`\n══ SCAN #${scanCount}  [${CONFIG.PRICE_SOURCE}]  ${ALL_KNIFE_NAMES.length} names to check ${"═".repeat(20)}`);
 
-  // ── 1. Fetch CSFloat pages ─────────────────────────────────────────────────
-  const allListings = [];
-  let cursor = null;
-
-  for (let p = 0; p < CONFIG.SCAN_PAGES; p++) {
-    log(`  [CSFloat] Page ${p + 1}/${CONFIG.SCAN_PAGES}${cursor ? " (cursor)" : ""}...`);
-
-    try {
-      const result = await fetchPage(cursor);
-      const { listings, cursor: nextCursor } = result;
-
-      if (!listings || listings.length === 0) {
-        log(`  [CSFloat] Page ${p + 1} empty — stopping`);
-        break;
-      }
-
-      allListings.push(...listings);
-      log(`  [CSFloat] Page ${p + 1}: got ${listings.length} listings (total: ${allListings.length})`);
-
-      cursor = nextCursor;
-      if (!cursor) {
-        log(`  [CSFloat] No more pages`);
-        break;
-      }
-    } catch (err) {
-      log(`  [CSFloat] Page ${p + 1} error: ${err.message}`);
-      break;
-    }
-
-    // Must wait at least 20s between CSFloat listing requests
-    if (p < CONFIG.SCAN_PAGES - 1 && cursor) {
-      log(`  [CSFloat] Waiting ${CONFIG.CSFLOAT_PAGE_DELAY_MS / 1000}s before next page (rate limit)...`);
-      await sleep(CONFIG.CSFLOAT_PAGE_DELAY_MS);
-    }
-  }
-
-  log(`  [CSFloat] Fetched ${allListings.length} listings total`);
-
-  // ── 2. Filter to target knife families ─────────────────────────────────────
-  const knifeListings = allListings.filter((l) => l.type === "buy_now" && isTargetKnife(l));
-  log(`  [Filter]  Matching knives: ${knifeListings.length}`);
-
-  if (knifeListings.length === 0) {
-    log("  No matching listings. Check KNIFE_FAMILIES or widen price range.");
-    return;
-  }
-
-  // ── 3. Resolve comparison price ───────────────────────────────────────────
   const results = [];
-  let hits = 0, misses = 0;
+  let namesWithListings = 0;
+  let namesEmpty        = 0;
+  let totalListings     = 0;
 
-  if (!USE_STEAM) {
-    log(`  [CSFloat] Resolving base prices (${knifeListings.length} listings)...`);
-
-    for (const listing of knifeListings) {
-      const name         = listing.item?.market_hash_name || "";
-      const baseCents    = getCsfloatBasePrice(listing);
-      const csfloatCents = listing.price;
-
-      if (CONFIG.DEBUG) {
-        process.stdout.write(
-          `  [Base] ${name.slice(0, 60).padEnd(60)} → ask: ${fmt(csfloatCents).padStart(9)}  base: `
-        );
-      }
-
-      if (baseCents == null) {
-        if (CONFIG.DEBUG) process.stdout.write("no ref data\n");
-        misses++;
-        continue;
-      }
-
-      const spreadCents = baseCents - csfloatCents;
-      const spreadPct   = (spreadCents / csfloatCents) * 100;
-
-      if (CONFIG.DEBUG) {
-        process.stdout.write(`${fmt(baseCents).padStart(9)}  spread: ${fmtSign(spreadCents)}\n`);
-      }
-      hits++;
-
-      if (spreadCents / 100 >= CONFIG.MIN_SPREAD_USD) {
-        results.push({
-          name,
-          listingId:    listing.id,
-          csfloatCents,
-          refCents:     baseCents,
-          spreadCents,
-          spreadPct,
-          floatVal:     listing.item?.float_value ?? null,
-          wearName:     listing.item?.wear_name || "",
-        });
-      }
-    }
-    log(`  [Base]  Evaluated: ${knifeListings.length}, Resolved: ${hits}, Missing ref: ${misses}`);
-
-  } else {
-    const uniqueNames = [...new Set(
-      knifeListings.map((l) => l.item?.market_hash_name).filter(Boolean)
-    )];
-
-    log(`  [Steam]  Fetching ${sourceLabel()} for ${uniqueNames.length} unique skin(s) (${knifeListings.length} total listings)...`);
+  // ── Pre-fetch Steam prices if needed (batch before the CSFloat loop) ────────
+  // We know all names upfront so we can warm the Steam cache in advance.
+  // This avoids interleaving slow Steam calls inside the already-slow CSFloat loop.
+  if (USE_STEAM) {
+    const uniqueNames = ALL_KNIFE_NAMES.filter((n) => !n.endsWith("Karambit") && !n.endsWith("Talon Knife")); // vanilla has no steam listing usually
+    log(`  [Steam]  Pre-fetching ${sourceLabel()} for ${uniqueNames.length} names...`);
     log(`  [Steam]  Delay: ${CONFIG.STEAM_REQUEST_DELAY_MS}ms | Cache TTL: ${CONFIG.STEAM_CACHE_TTL_SECONDS}s`);
 
-    const refPriceMap = new Map();
     for (let i = 0; i < uniqueNames.length; i++) {
       const name = uniqueNames[i];
+      const pct  = ((i / uniqueNames.length) * 100).toFixed(0);
       process.stdout.write(
-        `  [Steam] ${i + 1}/${uniqueNames.length} — ${name.slice(0, 55).padEnd(55)} `
+        `  [Steam] [${pct.padStart(3)}%] ${(i + 1)}/${uniqueNames.length} — ${name.slice(0, 55).padEnd(55)} `
       );
       const refCents = await getSteamPrice(name);
-      if (refCents == null) {
-        process.stdout.write("→ no data\n");
-      } else {
-        process.stdout.write(`→ ${fmt(refCents)}\n`);
-        refPriceMap.set(name, refCents);
-      }
+      process.stdout.write(refCents != null ? `→ ${fmt(refCents)}\n` : "→ no data\n");
     }
 
-    log(`  [Steam]  Prices resolved for ${refPriceMap.size}/${uniqueNames.length} unique skins`);
-
-    for (const listing of knifeListings) {
-      const name = listing.item?.market_hash_name || "";
-      if (!name) continue;
-
-      const refCents = refPriceMap.get(name);
-      if (refCents == null) { misses++; continue; }
-
-      const csfloatCents = listing.price;
-      const spreadCents  = refCents - csfloatCents;
-      const spreadPct    = (spreadCents / csfloatCents) * 100;
-      hits++;
-
-      if (CONFIG.DEBUG) {
-        log(
-          `  [Eval] ${name.slice(0, 50).padEnd(50)}` +
-          ` ask: ${fmt(csfloatCents).padStart(9)}  ref: ${fmt(refCents).padStart(9)}  spread: ${fmtSign(spreadCents)}`
-        );
-      }
-
-      if (spreadCents / 100 >= CONFIG.MIN_SPREAD_USD) {
-        results.push({
-          name,
-          listingId:    listing.id,
-          csfloatCents,
-          refCents,
-          spreadCents,
-          spreadPct,
-          floatVal:     listing.item?.float_value ?? null,
-          wearName:     listing.item?.wear_name || "",
-        });
-      }
-    }
-    log(`  [Steam]  Hits: ${hits}, No-ref: ${misses}`);
+    log(`  [Steam]  Pre-fetch complete. Cache has ${steamPriceCache.size} entries.`);
   }
 
-  // ── 4. Sort and trim ───────────────────────────────────────────────────────
-  results.sort((a, b) => b.spreadCents - a.spreadCents);
-  const top    = results.slice(0, CONFIG.TOP_N);
+  // ── Per-name CSFloat loop ──────────────────────────────────────────────────
+  for (let i = 0; i < ALL_KNIFE_NAMES.length; i++) {
+    const name = ALL_KNIFE_NAMES[i];
+    const pct  = ((i / ALL_KNIFE_NAMES.length) * 100).toFixed(0);
+
+    process.stdout.write(
+      `  [CSFloat] [${pct.padStart(3)}%] ${(i + 1).toString().padStart(3)}/${ALL_KNIFE_NAMES.length} ` +
+      `${name.slice(0, 60).padEnd(60)} → `
+    );
+
+    const listings = await fetchListingsForName(name);
+
+    if (listings.length === 0) {
+      process.stdout.write("no listings\n");
+      namesEmpty++;
+    } else {
+      process.stdout.write(`${listings.length} listing(s)`);
+      namesWithListings++;
+      totalListings += listings.length;
+
+      for (const listing of listings) {
+        let refCents = null;
+
+        if (!USE_STEAM) {
+          refCents = getCsfloatBasePrice(listing);
+        } else {
+          // Use cached Steam price (warm-fetched above)
+          const key =
+            name + (CONFIG.PRICE_SOURCE === "steam_max_buy_order" ? ":max_buy_order" : ":min_listing");
+          const cached = steamPriceCache.get(key);
+          if (cached) refCents = cached.cents;
+        }
+
+        if (refCents == null) {
+          if (CONFIG.DEBUG) process.stdout.write(" [no ref]");
+          continue;
+        }
+
+        const result = makeResult(listing, refCents);
+
+        if (CONFIG.DEBUG) {
+          process.stdout.write(
+            `\n    ask: ${fmt(result.csfloatCents).padStart(9)}  ref: ${fmt(refCents).padStart(9)}  spread: ${fmtSign(result.spreadCents)}`
+          );
+        }
+
+        if (result.spreadCents / 100 >= CONFIG.MIN_SPREAD_USD) {
+          results.push(result);
+        }
+      }
+
+      process.stdout.write("\n");
+    }
+
+    // Wait between CSFloat requests (except after the last one)
+    if (i < ALL_KNIFE_NAMES.length - 1) {
+      await sleep(CONFIG.CSFLOAT_NAME_DELAY_MS);
+    }
+  }
+
   const scanMs = Date.now() - scanStart;
 
-  // ── 5. Output ─────────────────────────────────────────────────────────────
+  log(`\n  ── Summary ──────────────────────────────────────────────`);
+  log(`  Names checked:     ${ALL_KNIFE_NAMES.length}`);
+  log(`  Names with data:   ${namesWithListings}`);
+  log(`  Names empty:       ${namesEmpty}`);
+  log(`  Total listings:    ${totalListings}`);
+  log(`  Results (spread ≥ $${CONFIG.MIN_SPREAD_USD}): ${results.length}`);
+  log(`  Scan time:         ${(scanMs / 1000).toFixed(1)}s`);
+
+  // ── Sort and trim ──────────────────────────────────────────────────────────
+  results.sort((a, b) => b.spreadCents - a.spreadCents);
+  const top = results.slice(0, CONFIG.TOP_N);
+
+  // ── Output ────────────────────────────────────────────────────────────────
   if (top.length > 0) {
     console.log(buildConsoleReport(top, scanMs));
     sendTelegram(buildTelegramReport(top, scanMs)).catch(() => {});
@@ -666,29 +685,34 @@ async function main() {
     process.exit(1);
   }
 
-  const familyLabel = CONFIG.KNIFE_FAMILIES.length > 0
-    ? CONFIG.KNIFE_FAMILIES.join(", ")
-    : "all knives (rarity=6)";
-
   console.log("╔══════════════════════════════════════════════════════╗");
   console.log("║           🗡️  KNIFE ARBITRAGE SCANNER                ║");
   console.log("╚══════════════════════════════════════════════════════╝");
-  console.log(`  Families:      ${familyLabel}`);
+  console.log(`  Knives:        Karambit (${KARAMBIT_NAMES.length} names) + Talon (${TALON_NAMES.length} names)`);
+  console.log(`  Total names:   ${ALL_KNIFE_NAMES.length} unique market_hash_names`);
   console.log(`  Price range:   $${CONFIG.MIN_PRICE_USD} – $${CONFIG.MAX_PRICE_USD}`);
   console.log(`  Price source:  ${sourceLabel()}`);
   if (USE_STEAM) {
     console.log(`  Steam delay:   ${CONFIG.STEAM_REQUEST_DELAY_MS}ms between requests`);
     console.log(`  Steam TTL:     ${CONFIG.STEAM_CACHE_TTL_SECONDS}s`);
   } else {
-    console.log(`  Steam:         skipped (base price from CSFloat payload)`);
+    console.log(`  Steam:         skipped (using CSFloat base price)`);
   }
-  console.log(`  Pages/scan:    ${CONFIG.SCAN_PAGES} × 50 = up to ${CONFIG.SCAN_PAGES * 50} listings`);
-  console.log(`  Page delay:    ${CONFIG.CSFLOAT_PAGE_DELAY_MS / 1000}s (CSFloat rate limit)`);
+  console.log(`  Listings/name: ${CONFIG.LISTINGS_PER_NAME}`);
+  console.log(`  Name delay:    ${CONFIG.CSFLOAT_NAME_DELAY_MS / 1000}s (CSFloat rate limit)`);
+  console.log(`  Est. scan:     ~${((ALL_KNIFE_NAMES.length * CONFIG.CSFLOAT_NAME_DELAY_MS) / 60000).toFixed(0)} min per full scan`);
   console.log(`  Top N:         ${CONFIG.TOP_N}`);
-  console.log(`  Min spread:    $${CONFIG.MIN_SPREAD_USD}  ← only show deals with profit >= this`);
-  console.log(`  Poll interval: ${CONFIG.POLL_INTERVAL_SECONDS > 0 ? CONFIG.POLL_INTERVAL_SECONDS + "s" : "single run (set POLL_INTERVAL_SECONDS>0 to loop)"}`);
+  console.log(`  Min spread:    $${CONFIG.MIN_SPREAD_USD}`);
+  console.log(`  Poll interval: ${CONFIG.POLL_INTERVAL_SECONDS > 0 ? CONFIG.POLL_INTERVAL_SECONDS + "s" : "single run"}`);
   console.log(`  Telegram:      ${CONFIG.TELEGRAM_BOT_TOKEN ? "active (chat " + CONFIG.TELEGRAM_CHAT_ID + ")" : "disabled"}`);
   console.log("");
+
+  // Print the full name list so the user can verify what will be scanned
+  if (CONFIG.DEBUG) {
+    console.log("  ── Names to scan ─────────────────────────────────────────────────────");
+    ALL_KNIFE_NAMES.forEach((n, i) => console.log(`  ${String(i + 1).padStart(3)}. ${n}`));
+    console.log("");
+  }
 
   await scan();
 
