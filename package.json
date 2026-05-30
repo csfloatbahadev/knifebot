@@ -1,0 +1,17 @@
+{
+  "name": "knife-arb",
+  "version": "1.0.0",
+  "description": "CSFloat → Steam buy-order spread scanner for Talon / Karambit / Butterfly knives",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev":   "DEBUG=true node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "undici": "^6.19.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
