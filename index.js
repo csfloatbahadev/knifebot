@@ -1,25 +1,16 @@
 require("dotenv").config();
 
+const fs   = require("fs");
+const path = require("path");
 const { Pool } = require("undici");
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STATIC KNIFE NAME LIST
-//  Generates every combination of (knife type) × (skin) × (wear) × (stattrak?)
-//  for Karambit and Talon Knife.
-//  CSFloat will simply return 0 listings for combinations that don't exist
-//  in-game — no error handling needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const WEARS = [
-  "Factory New",
-  "Minimal Wear",
-  "Field-Tested",
-  "Well-Worn",
-  "Battle-Scarred",
-];
+const WEARS = ["Factory New", "Minimal Wear", "Field-Tested", "Well-Worn", "Battle-Scarred"];
 
-// Skins that only come in specific wears.
-// If a skin isn't listed here it gets all 5 wears.
+// Skins that only come in specific wears
 const WEAR_OVERRIDE = {
   "Doppler":       ["Factory New", "Minimal Wear"],
   "Gamma Doppler": ["Factory New", "Minimal Wear"],
@@ -32,44 +23,20 @@ const WEAR_OVERRIDE = {
   "Rust Coat":     ["Battle-Scarred"],
 };
 
-// All skins available on both Karambit and Talon Knife.
 const SHARED_SKINS = [
-  "Doppler",
-  "Gamma Doppler",
-  "Marble Fade",
-  "Tiger Tooth",
-  "Fade",
-  "Slaughter",
-  "Crimson Web",
-  "Case Hardened",
-  "Black Laminate",
-  "Autotronic",
-  "Freehand",
-  "Bright Water",
-  "Ultraviolet",
-  "Night",
-  "Blue Steel",
-  "Stained",
-  "Damascus Steel",
-  "Urban Masked",
-  "Scorched",
-  "Forest DDPAT",
-  "Boreal Forest",
-  "Rust Coat",
+  "Doppler", "Gamma Doppler", "Marble Fade", "Tiger Tooth", "Fade",
+  "Slaughter", "Crimson Web", "Case Hardened", "Black Laminate",
+  "Autotronic", "Freehand", "Bright Water", "Ultraviolet", "Night",
+  "Blue Steel", "Stained", "Damascus Steel", "Urban Masked", "Scorched",
+  "Forest DDPAT", "Boreal Forest", "Rust Coat",
 ];
 
-// Skins exclusive to Karambit (added before Talon existed)
-const KARAMBIT_ONLY_SKINS = [
-  "Lore",
-];
+const KARAMBIT_ONLY_SKINS = ["Lore"];
 
 function buildNames(knifeBase, skins) {
   const names = [];
-
-  // Vanilla — no skin suffix, no wear
   names.push(`★ ${knifeBase}`);
   names.push(`★ StatTrak™ ${knifeBase}`);
-
   for (const skin of skins) {
     const wears = WEAR_OVERRIDE[skin] ?? WEARS;
     for (const wear of wears) {
@@ -77,14 +44,11 @@ function buildNames(knifeBase, skins) {
       names.push(`★ StatTrak™ ${knifeBase} | ${skin} (${wear})`);
     }
   }
-
   return names;
 }
 
 const KARAMBIT_NAMES = buildNames("Karambit", [...SHARED_SKINS, ...KARAMBIT_ONLY_SKINS]);
 const TALON_NAMES    = buildNames("Talon Knife", SHARED_SKINS);
-
-// Master list — deduplicated, alphabetically sorted for predictable scan order
 const ALL_KNIFE_NAMES = [...new Set([...KARAMBIT_NAMES, ...TALON_NAMES])].sort();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,34 +60,32 @@ const CONFIG = {
   MIN_PRICE_USD: parseFloat(process.env.MIN_PRICE_USD) || 50,
   MAX_PRICE_USD: parseFloat(process.env.MAX_PRICE_USD) || 5000,
 
-  // "csfloat_base"       → use listing.reference.base_price from CSFloat payload
-  // "steam_max_buy_order"→ Steam histogram highest_buy_order
-  // "steam_min_listing"  → Steam priceoverview lowest_price
+  // "csfloat_base"        → use listing.reference.base_price
+  // "steam_max_buy_order" → Steam histogram highest_buy_order
+  // "steam_min_listing"   → Steam priceoverview lowest_price
   PRICE_SOURCE: (process.env.PRICE_SOURCE || "csfloat_base").trim(),
 
-  TOP_N: Math.min(50, Math.max(1, parseInt(process.env.TOP_N) || 10)),
-
-  // How many listings to fetch per knife name (max 50 per CSFloat page).
-  LISTINGS_PER_NAME: Math.min(50, Math.max(1, parseInt(process.env.LISTINGS_PER_NAME) || 10)),
-
-  // Minimum profit (USD) to include a listing in results.
-  MIN_SPREAD_USD: parseFloat(process.env.MIN_SPREAD_USD) || 0,
-
-  // 0 = run once and exit. Set to e.g. 300 to rescan every 5 minutes.
+  TOP_N:              Math.min(50, Math.max(1, parseInt(process.env.TOP_N)              || 10)),
+  LISTINGS_PER_NAME:  Math.min(50, Math.max(1, parseInt(process.env.LISTINGS_PER_NAME) || 10)),
+  MIN_SPREAD_USD:     parseFloat(process.env.MIN_SPREAD_USD) || 0,
   POLL_INTERVAL_SECONDS: parseInt(process.env.POLL_INTERVAL_SECONDS) || 0,
 
-  // Delay between each per-name CSFloat request (API enforces ~20s)
+  // CSFloat: minimum 20s between listing requests
   CSFLOAT_NAME_DELAY_MS: Math.max(20000, parseInt(process.env.CSFLOAT_NAME_DELAY_MS) || 20000),
 
-  STEAM_REQUEST_DELAY_MS:  Math.max(500,  parseInt(process.env.STEAM_REQUEST_DELAY_MS)  || 1500),
-  STEAM_CACHE_TTL_SECONDS: Math.max(60,   parseInt(process.env.STEAM_CACHE_TTL_SECONDS) || 600),
-
   // CSFloat backoff on 429: 5 min → 10 min → 30 min
-  CSFLOAT_BACKOFF_STEPS_MS: [
-    5  * 60 * 1000,
-    10 * 60 * 1000,
-    30 * 60 * 1000,
-  ],
+  CSFLOAT_BACKOFF_STEPS_MS: [5 * 60_000, 10 * 60_000, 30 * 60_000],
+
+  // Steam: delay between requests, cache TTL, and per-item retry count
+  STEAM_REQUEST_DELAY_MS:  Math.max(1500, parseInt(process.env.STEAM_REQUEST_DELAY_MS)  || 3000),
+  STEAM_CACHE_TTL_SECONDS: Math.max(300,  parseInt(process.env.STEAM_CACHE_TTL_SECONDS) || 3600),
+  STEAM_RETRIES:           Math.max(1,    parseInt(process.env.STEAM_RETRIES)           || 2),
+  // How long to cool down after N consecutive Steam failures
+  STEAM_BACKOFF_MS:        Math.max(30000, parseInt(process.env.STEAM_BACKOFF_MS) || 60000),
+  STEAM_FAIL_THRESHOLD:    Math.max(1,     parseInt(process.env.STEAM_FAIL_THRESHOLD) || 5),
+
+  // Path to persist the Steam price cache between runs
+  STEAM_CACHE_FILE: process.env.STEAM_CACHE_FILE || path.join(__dirname, "steam-cache.json"),
 
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || "",
   TELEGRAM_CHAT_ID:   process.env.TELEGRAM_CHAT_ID   || "",
@@ -149,11 +111,48 @@ const USE_STEAM = CONFIG.PRICE_SOURCE !== "csfloat_base";
 //  STATE
 // ─────────────────────────────────────────────────────────────────────────────
 let scanCount = 0;
+
+// CSFloat backoff
 let csfloatBackoffUntil = 0;
 let csfloatBackoffLevel = 0;
 
-const steamNameidCache = new Map();
-const steamPriceCache  = new Map();
+// Steam state
+let steamRateLimitUntil      = 0;   // don't touch Steam until this timestamp
+let steamConsecutiveFails     = 0;   // consecutive "no data" responses
+const steamNameidCache        = new Map();
+const steamPriceCache         = new Map(); // key → { cents, ts }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  STEAM DISK CACHE
+// ─────────────────────────────────────────────────────────────────────────────
+function loadSteamCache() {
+  try {
+    const raw  = fs.readFileSync(CONFIG.STEAM_CACHE_FILE, "utf8");
+    const data = JSON.parse(raw);
+    const ttlMs = CONFIG.STEAM_CACHE_TTL_SECONDS * 1000;
+    let loaded = 0;
+    for (const [key, entry] of Object.entries(data)) {
+      if (entry && typeof entry.cents === "number" && Date.now() - entry.ts < ttlMs) {
+        steamPriceCache.set(key, entry);
+        loaded++;
+      }
+    }
+    log(`  [Steam] Loaded ${loaded} valid cached prices from disk (${CONFIG.STEAM_CACHE_FILE})`);
+  } catch (err) {
+    if (err.code !== "ENOENT") log(`  [Steam] Cache load warning: ${err.message}`);
+  }
+}
+
+function saveSteamCache() {
+  const obj = {};
+  for (const [key, val] of steamPriceCache.entries()) obj[key] = val;
+  try {
+    fs.writeFileSync(CONFIG.STEAM_CACHE_FILE, JSON.stringify(obj, null, 2));
+    if (CONFIG.DEBUG) log(`  [Steam] Cache saved (${steamPriceCache.size} entries)`);
+  } catch (err) {
+    log(`  [Steam] Cache save failed: ${err.message}`);
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  HTTP POOLS
@@ -169,7 +168,7 @@ const csfloatPool = new Pool("https://csfloat.com", {
 const steamPool = USE_STEAM
   ? new Pool("https://steamcommunity.com", {
       connections: 2,
-      pipelining:  1,
+      pipelining:  0,                  // no pipelining — Steam is finicky
       keepAliveTimeout:    30_000,
       keepAliveMaxTimeout: 60_000,
       maxRedirections:     5,
@@ -188,25 +187,14 @@ const telegramPool = new Pool("https://api.telegram.org", {
 // ─────────────────────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function fmt(cents) {
-  return "$" + (cents / 100).toFixed(2);
-}
-
-function fmtSign(cents) {
-  return (cents >= 0 ? "+" : "") + fmt(cents);
-}
-
+function fmt(cents)     { return "$" + (cents / 100).toFixed(2); }
+function fmtSign(cents) { return (cents >= 0 ? "+" : "") + fmt(cents); }
 function h(text) {
   return String(text)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-
-function log(...args) {
-  console.log("[" + new Date().toISOString() + "]", ...args);
-}
+function log(...args) { console.log("[" + new Date().toISOString() + "]", ...args); }
 
 function sourceLabel() {
   return {
@@ -262,40 +250,29 @@ async function csfloatRequest(path) {
   return JSON.parse(text);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  FETCH LISTINGS FOR A SPECIFIC MARKET HASH NAME
-//
-//  Queries CSFloat for buy-now listings of an exact skin name.
-//  Returns the cheapest N listings sorted by price ascending.
-//  If CSFloat returns nothing (skin doesn't exist or no listings), returns [].
-// ─────────────────────────────────────────────────────────────────────────────
 async function fetchListingsForName(marketHashName) {
-  const params = new URLSearchParams({
-    market_hash_name: marketHashName,
-    type:             "buy_now",
-    sort_by:          "lowest_price",
-    min_price:        String(MIN_PRICE_CENTS),
-    max_price:        String(MAX_PRICE_CENTS),
-    limit:            String(CONFIG.LISTINGS_PER_NAME),
-  });
+  // Use encodeURIComponent so ★ → %E2%98%85 and space → %20 (not +)
+  const params =
+    `market_hash_name=${encodeURIComponent(marketHashName)}` +
+    `&type=buy_now` +
+    `&sort_by=lowest_price` +
+    `&min_price=${MIN_PRICE_CENTS}` +
+    `&max_price=${MAX_PRICE_CENTS}` +
+    `&limit=${CONFIG.LISTINGS_PER_NAME}`;
 
   let data;
   try {
-    data = await csfloatRequest("/api/v1/listings?" + params.toString());
+    data = await csfloatRequest("/api/v1/listings?" + params);
   } catch (err) {
     log(`  [CSFloat] Error fetching "${marketHashName}": ${err.message}`);
     return [];
   }
 
-  if (!data) return []; // rate-limited, backoff already applied
-
+  if (!data) return [];
   const listings = Array.isArray(data) ? data : (data.data || []);
   return listings.filter((l) => l.type === "buy_now");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  CSFLOAT BASE PRICE HELPER
-// ─────────────────────────────────────────────────────────────────────────────
 function getCsfloatBasePrice(listing) {
   const ref = listing.reference;
   if (!ref) return null;
@@ -305,42 +282,104 @@ function getCsfloatBasePrice(listing) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STEAM API
+//
+//  Key fixes vs the original:
+//  1. encodeURIComponent for all name params (★ and spaces properly encoded)
+//  2. Browser-realistic headers: Referer, Accept-Language, X-Requested-With
+//  3. HTML-response detection (Steam returns HTML on blocks/captchas)
+//  4. Retry with longer delay on failure
+//  5. Global rate-limit state: after STEAM_FAIL_THRESHOLD consecutive fails,
+//     pause all Steam requests for STEAM_BACKOFF_MS
+//  6. Disk-persisted cache so prices survive restarts
 // ─────────────────────────────────────────────────────────────────────────────
-async function steamGet(path) {
-  const { statusCode, body } = await steamPool.request({
-    method: "GET",
-    path,
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-      Accept:       "application/json, text/html, */*",
-    },
-  });
 
-  const text = await body.text();
+// Steam browser-like request headers
+const STEAM_HEADERS = {
+  "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept":          "application/json, text/javascript, */*; q=0.01",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Referer":         "https://steamcommunity.com/market/",
+  "X-Requested-With":"XMLHttpRequest",
+  "Sec-Fetch-Dest":  "empty",
+  "Sec-Fetch-Mode":  "cors",
+  "Sec-Fetch-Site":  "same-origin",
+};
 
-  if (statusCode === 429) {
-    log("  [Steam] ⚠️  429 rate limited on:", path);
-    return null;
+async function steamGet(requestPath) {
+  // Global Steam rate-limit gate
+  if (Date.now() < steamRateLimitUntil) {
+    const wait = steamRateLimitUntil - Date.now();
+    log(`  [Steam] Rate-limit gate active — waiting ${Math.ceil(wait / 1000)}s...`);
+    await sleep(wait);
   }
-  if (statusCode !== 200) {
-    log(`  [Steam] HTTP ${statusCode} on: ${path}`);
-    return null;
+
+  for (let attempt = 1; attempt <= CONFIG.STEAM_RETRIES; attempt++) {
+    let statusCode, text;
+    try {
+      const resp = await steamPool.request({
+        method:  "GET",
+        path:    requestPath,
+        headers: STEAM_HEADERS,
+      });
+      statusCode = resp.statusCode;
+      text = await resp.body.text();
+    } catch (connErr) {
+      log(`  [Steam] Connection error (attempt ${attempt}): ${connErr.message}`);
+      if (attempt < CONFIG.STEAM_RETRIES) await sleep(CONFIG.STEAM_REQUEST_DELAY_MS * attempt);
+      continue;
+    }
+
+    if (statusCode === 429) {
+      const backoff = CONFIG.STEAM_BACKOFF_MS * attempt;
+      steamRateLimitUntil = Date.now() + backoff;
+      log(`  [Steam] ⚠️  429 — cooling ${(backoff / 1000).toFixed(0)}s (attempt ${attempt})`);
+      await sleep(backoff);
+      continue;
+    }
+
+    if (statusCode !== 200) {
+      if (CONFIG.DEBUG) log(`  [Steam] HTTP ${statusCode} on: ${requestPath}`);
+      if (attempt < CONFIG.STEAM_RETRIES) await sleep(CONFIG.STEAM_REQUEST_DELAY_MS * attempt);
+      continue;
+    }
+
+    // Detect HTML response (Steam login redirect, captcha, or block page)
+    if (text.trimStart().startsWith("<")) {
+      log(`  [Steam] ⚠️  Got HTML instead of JSON — Steam may be blocking requests`);
+      if (CONFIG.DEBUG) log(`  [Steam] Response preview: ${text.slice(0, 400)}`);
+      steamConsecutiveFails++;
+      if (steamConsecutiveFails >= CONFIG.STEAM_FAIL_THRESHOLD) {
+        steamRateLimitUntil = Date.now() + CONFIG.STEAM_BACKOFF_MS;
+        log(`  [Steam] ⚠️  ${steamConsecutiveFails} consecutive HTML responses — pausing ${CONFIG.STEAM_BACKOFF_MS / 1000}s`);
+        steamConsecutiveFails = 0;
+      }
+      return null;
+    }
+
+    // Success — reset failure counter
+    steamConsecutiveFails = 0;
+    return text;
   }
-  return text;
+
+  return null;
 }
 
+// ── Nameid lookup (for max buy order) ─────────────────────────────────────────
 async function getSteamNameid(name) {
   if (steamNameidCache.has(name)) return steamNameidCache.get(name);
 
   await sleep(CONFIG.STEAM_REQUEST_DELAY_MS);
 
-  const path = "/market/listings/730/" + encodeURIComponent(name);
-  const html = await steamGet(path);
+  // encodeURIComponent: space → %20, ★ → %E2%98%85, | → %7C
+  const requestPath = "/market/listings/730/" + encodeURIComponent(name);
+  const html = await steamGet(requestPath);
   if (!html) return null;
 
   const match = html.match(/Market_LoadOrderSpread\(\s*(\d+)\s*\)/);
   if (!match) {
-    if (CONFIG.DEBUG) log("  [Steam] Could not extract nameid for:", name);
+    if (CONFIG.DEBUG) log(`  [Steam] Could not extract nameid for: ${name}`);
+    steamConsecutiveFails++;
     return null;
   }
 
@@ -348,10 +387,11 @@ async function getSteamNameid(name) {
   return match[1];
 }
 
+// ── Max buy order ──────────────────────────────────────────────────────────────
 async function getSteamMaxBuyOrder(name) {
-  const key    = name + ":max_buy_order";
-  const cached = steamPriceCache.get(key);
-  const ttlMs  = CONFIG.STEAM_CACHE_TTL_SECONDS * 1000;
+  const cacheKey = name + ":max_buy_order";
+  const ttlMs    = CONFIG.STEAM_CACHE_TTL_SECONDS * 1000;
+  const cached   = steamPriceCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < ttlMs) return cached.cents;
 
   const nameid = await getSteamNameid(name);
@@ -359,54 +399,79 @@ async function getSteamMaxBuyOrder(name) {
 
   await sleep(CONFIG.STEAM_REQUEST_DELAY_MS);
 
-  const qs = new URLSearchParams({
-    country:     "US",
-    language:    "english",
-    currency:    "1",
-    item_nameid: nameid,
-    two_factor:  "0",
-  });
+  // Build URL manually so spaces → %20, not +
+  const requestPath =
+    `/market/itemordershistogram` +
+    `?country=US&language=english&currency=1` +
+    `&item_nameid=${encodeURIComponent(nameid)}` +
+    `&two_factor=0`;
 
-  const text = await steamGet("/market/itemordershistogram?" + qs.toString());
+  const text = await steamGet(requestPath);
   if (!text) return null;
 
   let data;
-  try { data = JSON.parse(text); } catch { return null; }
-  if (!data?.success) return null;
+  try { data = JSON.parse(text); } catch (e) {
+    if (CONFIG.DEBUG) log(`  [Steam] JSON parse error for buy order "${name}": ${e.message}`);
+    return null;
+  }
+
+  if (!data?.success) {
+    if (CONFIG.DEBUG) log(`  [Steam] success=false for buy order "${name}": ${JSON.stringify(data)}`);
+    steamConsecutiveFails++;
+    return null;
+  }
 
   const cents = data.highest_buy_order ? parseInt(data.highest_buy_order, 10) : null;
-  if (cents && cents > 0) steamPriceCache.set(key, { cents, ts: Date.now() });
+  if (cents && cents > 0) {
+    steamPriceCache.set(cacheKey, { cents, ts: Date.now() });
+    steamConsecutiveFails = 0;
+  }
   return cents || null;
 }
 
+// ── Min listing price ─────────────────────────────────────────────────────────
 async function getSteamMinListing(name) {
-  const key    = name + ":min_listing";
-  const cached = steamPriceCache.get(key);
-  const ttlMs  = CONFIG.STEAM_CACHE_TTL_SECONDS * 1000;
+  const cacheKey = name + ":min_listing";
+  const ttlMs    = CONFIG.STEAM_CACHE_TTL_SECONDS * 1000;
+  const cached   = steamPriceCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < ttlMs) return cached.cents;
 
   await sleep(CONFIG.STEAM_REQUEST_DELAY_MS);
 
-  const qs = new URLSearchParams({
-    appid:            "730",
-    currency:         "1",
-    market_hash_name: name,
-  });
+  // IMPORTANT: build URL manually with encodeURIComponent so:
+  //   space → %20  (not +, which URLSearchParams produces)
+  //   ★     → %E2%98%85
+  //   |     → %7C
+  // Steam's priceoverview API requires proper percent-encoding.
+  const requestPath =
+    `/market/priceoverview/` +
+    `?appid=730&currency=1` +
+    `&market_hash_name=${encodeURIComponent(name)}`;
 
-  const text = await steamGet("/market/priceoverview/?" + qs.toString());
+  const text = await steamGet(requestPath);
   if (!text) return null;
 
   let data;
-  try { data = JSON.parse(text); } catch { return null; }
-  if (!data?.success) return null;
+  try { data = JSON.parse(text); } catch (e) {
+    if (CONFIG.DEBUG) log(`  [Steam] JSON parse error for "${name}": ${e.message}`);
+    return null;
+  }
+
+  if (!data?.success) {
+    if (CONFIG.DEBUG) log(`  [Steam] success=false for "${name}": ${JSON.stringify(data)}`);
+    steamConsecutiveFails++;
+    return null;
+  }
 
   const raw    = data.lowest_price;
-  const parsed = raw ? parseFloat(String(raw).replace(/[^0-9.]/g, "")) : NaN;
-  if (isNaN(parsed)) return null;
+  if (!raw) return null;                               // no listings on Steam
+  const parsed = parseFloat(String(raw).replace(/[^0-9.]/g, ""));
+  if (isNaN(parsed) || parsed <= 0) return null;
 
   const cents = Math.round(parsed * 100);
-  if (cents > 0) steamPriceCache.set(key, { cents, ts: Date.now() });
-  return cents || null;
+  steamPriceCache.set(cacheKey, { cents, ts: Date.now() });
+  steamConsecutiveFails = 0;
+  return cents;
 }
 
 async function getSteamPrice(name) {
@@ -447,9 +512,8 @@ async function sendTelegram(text) {
 //  REPORT BUILDERS
 // ─────────────────────────────────────────────────────────────────────────────
 function buildConsoleReport(results, scanMs) {
-  const W = 115;
+  const W   = 115;
   const div = "─".repeat(W);
-
   const refColHeader = {
     csfloat_base:        "BASE PRICE",
     steam_max_buy_order: "STEAM MAX BO",
@@ -472,17 +536,13 @@ function buildConsoleReport(results, scanMs) {
   ];
 
   for (let i = 0; i < results.length; i++) {
-    const r         = results[i];
-    const rank      = String(i + 1).padEnd(3);
-    const spread    = fmt(r.spreadCents).padStart(10);
-    const pctStr    = (r.spreadPct >= 0 ? "+" : "") + r.spreadPct.toFixed(1) + "%";
-    const csPrice   = fmt(r.csfloatCents).padStart(10);
-    const refPrice  = fmt(r.refCents).padStart(14);
-    const floatStr  = (r.floatVal != null ? r.floatVal.toFixed(4) : "N/A").padStart(8);
-    const emoji     = r.spreadCents >= 500 ? "✅" : r.spreadCents >= 0 ? "🟡" : "🔴";
-
+    const r       = results[i];
+    const pctStr  = (r.spreadPct >= 0 ? "+" : "") + r.spreadPct.toFixed(1) + "%";
+    const floatStr = (r.floatVal != null ? r.floatVal.toFixed(4) : "N/A").padStart(8);
+    const emoji   = r.spreadCents >= 500 ? "✅" : r.spreadCents >= 0 ? "🟡" : "🔴";
     lines.push(
-      `  ${rank}${spread}  ${pctStr.padStart(8)}  ${csPrice}${refPrice}  ${floatStr}  ${emoji} ${r.name}`
+      `  ${String(i + 1).padEnd(3)}${fmt(r.spreadCents).padStart(10)}  ${pctStr.padStart(8)}  ` +
+      `${fmt(r.csfloatCents).padStart(10)}${fmt(r.refCents).padStart(14)}  ${floatStr}  ${emoji} ${r.name}`
     );
   }
 
@@ -502,16 +562,16 @@ function buildTelegramReport(results, scanMs) {
     `<i>Karambit + Talon  |  ${h(srcShort)}  |  ${(scanMs / 1000).toFixed(1)}s</i>\n\n`;
 
   for (let i = 0; i < results.length; i++) {
-    const r          = results[i];
-    const emoji      = r.spreadCents >= 500 ? "✅" : r.spreadCents >= 0 ? "🟡" : "🔴";
-    const spreadSign = r.spreadCents >= 0 ? "+" : "";
-    const url        = "https://csfloat.com/item/" + r.listingId;
-    const refLabel   = CONFIG.PRICE_SOURCE === "csfloat_base" ? "Base" :
-                       CONFIG.PRICE_SOURCE === "steam_max_buy_order" ? "Steam BO" : "Steam lst";
+    const r         = results[i];
+    const emoji     = r.spreadCents >= 500 ? "✅" : r.spreadCents >= 0 ? "🟡" : "🔴";
+    const sign      = r.spreadCents >= 0 ? "+" : "";
+    const url       = "https://csfloat.com/item/" + r.listingId;
+    const refLabel  = CONFIG.PRICE_SOURCE === "csfloat_base" ? "Base" :
+                      CONFIG.PRICE_SOURCE === "steam_max_buy_order" ? "Steam BO" : "Steam lst";
 
     msg +=
       `${emoji} <b>${i + 1}. ${h(r.name)}</b>\n` +
-      `   Spread: <b>${spreadSign}${h(fmt(r.spreadCents))}</b> (${spreadSign}${r.spreadPct.toFixed(1)}%)\n` +
+      `   Spread: <b>${sign}${h(fmt(r.spreadCents))}</b> (${sign}${r.spreadPct.toFixed(1)}%)\n` +
       `   CSFloat: <b>${h(fmt(r.csfloatCents))}</b>  ${h(refLabel)}: <b>${h(fmt(r.refCents))}</b>\n` +
       `   Float: <code>${r.floatVal != null ? r.floatVal.toFixed(6) : "N/A"}</code>  ` +
       (r.wearName ? `<i>${h(r.wearName)}</i>  ` : "") +
@@ -522,14 +582,13 @@ function buildTelegramReport(results, scanMs) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  PROCESS ONE LISTING → RESULT OBJECT
+//  MAIN SCAN
 // ─────────────────────────────────────────────────────────────────────────────
 function makeResult(listing, refCents) {
   const name         = listing.item?.market_hash_name || "";
   const csfloatCents = listing.price;
   const spreadCents  = refCents - csfloatCents;
   const spreadPct    = (spreadCents / csfloatCents) * 100;
-
   return {
     name,
     listingId:    listing.id,
@@ -537,25 +596,11 @@ function makeResult(listing, refCents) {
     refCents,
     spreadCents,
     spreadPct,
-    floatVal:     listing.item?.float_value ?? null,
-    wearName:     listing.item?.wear_name || "",
+    floatVal:  listing.item?.float_value ?? null,
+    wearName:  listing.item?.wear_name || "",
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MAIN SCAN
-//
-//  Iterates over every knife name in ALL_KNIFE_NAMES.
-//  For each name:
-//    1. Fetch cheapest N listings from CSFloat
-//    2. Resolve the reference price (CSFloat base or Steam)
-//    3. Compute spread and collect qualifying results
-//    4. Wait CSFLOAT_NAME_DELAY_MS before the next name
-//
-//  Total scan time ≈ ALL_KNIFE_NAMES.length × 20s
-//  (~196 names × 20s ≈ 65 minutes for a full scan)
-//  Set POLL_INTERVAL_SECONDS accordingly (e.g. 3600 to re-scan hourly).
-// ─────────────────────────────────────────────────────────────────────────────
 async function scan() {
   if (Date.now() < csfloatBackoffUntil) {
     const secs = Math.ceil((csfloatBackoffUntil - Date.now()) / 1000);
@@ -565,51 +610,77 @@ async function scan() {
 
   scanCount++;
   const scanStart = Date.now();
-  log(`\n══ SCAN #${scanCount}  [${CONFIG.PRICE_SOURCE}]  ${ALL_KNIFE_NAMES.length} names to check ${"═".repeat(20)}`);
+  log(`\n══ SCAN #${scanCount}  [${CONFIG.PRICE_SOURCE}]  ${ALL_KNIFE_NAMES.length} names ${"═".repeat(25)}`);
 
-  const results = [];
-  let namesWithListings = 0;
-  let namesEmpty        = 0;
-  let totalListings     = 0;
+  const results          = [];
+  let namesWithListings  = 0;
+  let namesEmpty         = 0;
+  let totalListings      = 0;
+  let steamHits          = 0;
+  let steamMisses        = 0;
 
-  // ── Pre-fetch Steam prices if needed (batch before the CSFloat loop) ────────
-  // We know all names upfront so we can warm the Steam cache in advance.
-  // This avoids interleaving slow Steam calls inside the already-slow CSFloat loop.
+  // ── 1. Pre-fetch Steam prices (batched, before the slow CSFloat loop) ──────
   if (USE_STEAM) {
-    const uniqueNames = ALL_KNIFE_NAMES.filter((n) => !n.endsWith("Karambit") && !n.endsWith("Talon Knife")); // vanilla has no steam listing usually
-    log(`  [Steam]  Pre-fetching ${sourceLabel()} for ${uniqueNames.length} names...`);
-    log(`  [Steam]  Delay: ${CONFIG.STEAM_REQUEST_DELAY_MS}ms | Cache TTL: ${CONFIG.STEAM_CACHE_TTL_SECONDS}s`);
+    // Vanilla knives usually have no Steam market listing — skip them
+    const steamNames = ALL_KNIFE_NAMES.filter(
+      (n) => n !== "★ Karambit" && n !== "★ StatTrak™ Karambit" &&
+             n !== "★ Talon Knife" && n !== "★ StatTrak™ Talon Knife"
+    );
 
-    for (let i = 0; i < uniqueNames.length; i++) {
-      const name = uniqueNames[i];
-      const pct  = ((i / uniqueNames.length) * 100).toFixed(0);
+    // Only fetch names not already in cache
+    const toFetch = steamNames.filter((name) => {
+      const key    = name + (CONFIG.PRICE_SOURCE === "steam_max_buy_order" ? ":max_buy_order" : ":min_listing");
+      const cached = steamPriceCache.get(key);
+      return !(cached && Date.now() - cached.ts < CONFIG.STEAM_CACHE_TTL_SECONDS * 1000);
+    });
+
+    log(`  [Steam]  Pre-fetch: ${toFetch.length} uncached / ${steamNames.length} total names`);
+    log(`  [Steam]  Delay: ${CONFIG.STEAM_REQUEST_DELAY_MS}ms | TTL: ${CONFIG.STEAM_CACHE_TTL_SECONDS}s | Retries: ${CONFIG.STEAM_RETRIES}`);
+
+    for (let i = 0; i < toFetch.length; i++) {
+      const name = toFetch[i];
+      const pct  = ((i / toFetch.length) * 100).toFixed(0);
+
       process.stdout.write(
-        `  [Steam] [${pct.padStart(3)}%] ${(i + 1)}/${uniqueNames.length} — ${name.slice(0, 55).padEnd(55)} `
+        `  [Steam] [${pct.padStart(3)}%] ${(i + 1).toString().padStart(4)}/${toFetch.length}` +
+        `  ${name.slice(0, 58).padEnd(58)} `
       );
+
       const refCents = await getSteamPrice(name);
-      process.stdout.write(refCents != null ? `→ ${fmt(refCents)}\n` : "→ no data\n");
+
+      if (refCents != null) {
+        process.stdout.write(`→ ${fmt(refCents)}\n`);
+        steamHits++;
+      } else {
+        process.stdout.write("→ no data\n");
+        steamMisses++;
+      }
     }
 
-    log(`  [Steam]  Pre-fetch complete. Cache has ${steamPriceCache.size} entries.`);
+    // Persist updated cache to disk
+    saveSteamCache();
+
+    const cacheTotal = steamPriceCache.size;
+    log(`  [Steam]  Pre-fetch done. Hits: ${steamHits}, Misses: ${steamMisses}, Cache total: ${cacheTotal}`);
   }
 
-  // ── Per-name CSFloat loop ──────────────────────────────────────────────────
+  // ── 2. Per-name CSFloat loop ───────────────────────────────────────────────
   for (let i = 0; i < ALL_KNIFE_NAMES.length; i++) {
     const name = ALL_KNIFE_NAMES[i];
     const pct  = ((i / ALL_KNIFE_NAMES.length) * 100).toFixed(0);
 
     process.stdout.write(
-      `  [CSFloat] [${pct.padStart(3)}%] ${(i + 1).toString().padStart(3)}/${ALL_KNIFE_NAMES.length} ` +
-      `${name.slice(0, 60).padEnd(60)} → `
+      `  [CSFloat] [${pct.padStart(3)}%] ${(i + 1).toString().padStart(3)}/${ALL_KNIFE_NAMES.length}` +
+      `  ${name.slice(0, 58).padEnd(58)} → `
     );
 
     const listings = await fetchListingsForName(name);
 
     if (listings.length === 0) {
-      process.stdout.write("no listings\n");
+      process.stdout.write("—\n");
       namesEmpty++;
     } else {
-      process.stdout.write(`${listings.length} listing(s)`);
+      process.stdout.write(`${listings.length} listing(s)\n`);
       namesWithListings++;
       totalListings += listings.length;
 
@@ -619,23 +690,20 @@ async function scan() {
         if (!USE_STEAM) {
           refCents = getCsfloatBasePrice(listing);
         } else {
-          // Use cached Steam price (warm-fetched above)
-          const key =
-            name + (CONFIG.PRICE_SOURCE === "steam_max_buy_order" ? ":max_buy_order" : ":min_listing");
+          const key    = name + (CONFIG.PRICE_SOURCE === "steam_max_buy_order" ? ":max_buy_order" : ":min_listing");
           const cached = steamPriceCache.get(key);
           if (cached) refCents = cached.cents;
         }
 
-        if (refCents == null) {
-          if (CONFIG.DEBUG) process.stdout.write(" [no ref]");
-          continue;
-        }
+        if (refCents == null) continue;
 
         const result = makeResult(listing, refCents);
-
         if (CONFIG.DEBUG) {
-          process.stdout.write(
-            `\n    ask: ${fmt(result.csfloatCents).padStart(9)}  ref: ${fmt(refCents).padStart(9)}  spread: ${fmtSign(result.spreadCents)}`
+          log(
+            `    ${name.slice(0, 50).padEnd(50)}` +
+            `  ask: ${fmt(result.csfloatCents).padStart(9)}` +
+            `  ref: ${fmt(refCents).padStart(9)}` +
+            `  spread: ${fmtSign(result.spreadCents)}`
           );
         }
 
@@ -643,11 +711,8 @@ async function scan() {
           results.push(result);
         }
       }
-
-      process.stdout.write("\n");
     }
 
-    // Wait between CSFloat requests (except after the last one)
     if (i < ALL_KNIFE_NAMES.length - 1) {
       await sleep(CONFIG.CSFLOAT_NAME_DELAY_MS);
     }
@@ -656,18 +721,15 @@ async function scan() {
   const scanMs = Date.now() - scanStart;
 
   log(`\n  ── Summary ──────────────────────────────────────────────`);
-  log(`  Names checked:     ${ALL_KNIFE_NAMES.length}`);
-  log(`  Names with data:   ${namesWithListings}`);
-  log(`  Names empty:       ${namesEmpty}`);
-  log(`  Total listings:    ${totalListings}`);
-  log(`  Results (spread ≥ $${CONFIG.MIN_SPREAD_USD}): ${results.length}`);
-  log(`  Scan time:         ${(scanMs / 1000).toFixed(1)}s`);
+  log(`  Names checked:   ${ALL_KNIFE_NAMES.length}`);
+  log(`  With listings:   ${namesWithListings} | Empty: ${namesEmpty}`);
+  log(`  Total listings:  ${totalListings}`);
+  log(`  Results:         ${results.length} with spread ≥ $${CONFIG.MIN_SPREAD_USD}`);
+  log(`  Scan time:       ${(scanMs / 1000).toFixed(1)}s`);
 
-  // ── Sort and trim ──────────────────────────────────────────────────────────
   results.sort((a, b) => b.spreadCents - a.spreadCents);
   const top = results.slice(0, CONFIG.TOP_N);
 
-  // ── Output ────────────────────────────────────────────────────────────────
   if (top.length > 0) {
     console.log(buildConsoleReport(top, scanMs));
     sendTelegram(buildTelegramReport(top, scanMs)).catch(() => {});
@@ -685,34 +747,32 @@ async function main() {
     process.exit(1);
   }
 
+  // Load Steam disk cache before printing startup banner
+  if (USE_STEAM) loadSteamCache();
+
   console.log("╔══════════════════════════════════════════════════════╗");
   console.log("║           🗡️  KNIFE ARBITRAGE SCANNER                ║");
   console.log("╚══════════════════════════════════════════════════════╝");
-  console.log(`  Knives:        Karambit (${KARAMBIT_NAMES.length} names) + Talon (${TALON_NAMES.length} names)`);
-  console.log(`  Total names:   ${ALL_KNIFE_NAMES.length} unique market_hash_names`);
-  console.log(`  Price range:   $${CONFIG.MIN_PRICE_USD} – $${CONFIG.MAX_PRICE_USD}`);
-  console.log(`  Price source:  ${sourceLabel()}`);
+  console.log(`  Knives:         Karambit (${KARAMBIT_NAMES.length}) + Talon (${TALON_NAMES.length}) = ${ALL_KNIFE_NAMES.length} unique names`);
+  console.log(`  Price range:    $${CONFIG.MIN_PRICE_USD} – $${CONFIG.MAX_PRICE_USD}`);
+  console.log(`  Price source:   ${sourceLabel()}`);
   if (USE_STEAM) {
-    console.log(`  Steam delay:   ${CONFIG.STEAM_REQUEST_DELAY_MS}ms between requests`);
-    console.log(`  Steam TTL:     ${CONFIG.STEAM_CACHE_TTL_SECONDS}s`);
+    console.log(`  Steam delay:    ${CONFIG.STEAM_REQUEST_DELAY_MS}ms between requests`);
+    console.log(`  Steam retries:  ${CONFIG.STEAM_RETRIES} per item`);
+    console.log(`  Steam TTL:      ${CONFIG.STEAM_CACHE_TTL_SECONDS}s (${(CONFIG.STEAM_CACHE_TTL_SECONDS / 3600).toFixed(1)}h)`);
+    console.log(`  Steam fail gate:${CONFIG.STEAM_FAIL_THRESHOLD} consecutive fails → ${CONFIG.STEAM_BACKOFF_MS / 1000}s pause`);
+    console.log(`  Steam cache:    ${CONFIG.STEAM_CACHE_FILE}`);
   } else {
-    console.log(`  Steam:         skipped (using CSFloat base price)`);
+    console.log(`  Steam:          skipped (using CSFloat base price)`);
   }
-  console.log(`  Listings/name: ${CONFIG.LISTINGS_PER_NAME}`);
-  console.log(`  Name delay:    ${CONFIG.CSFLOAT_NAME_DELAY_MS / 1000}s (CSFloat rate limit)`);
-  console.log(`  Est. scan:     ~${((ALL_KNIFE_NAMES.length * CONFIG.CSFLOAT_NAME_DELAY_MS) / 60000).toFixed(0)} min per full scan`);
-  console.log(`  Top N:         ${CONFIG.TOP_N}`);
-  console.log(`  Min spread:    $${CONFIG.MIN_SPREAD_USD}`);
-  console.log(`  Poll interval: ${CONFIG.POLL_INTERVAL_SECONDS > 0 ? CONFIG.POLL_INTERVAL_SECONDS + "s" : "single run"}`);
-  console.log(`  Telegram:      ${CONFIG.TELEGRAM_BOT_TOKEN ? "active (chat " + CONFIG.TELEGRAM_CHAT_ID + ")" : "disabled"}`);
+  console.log(`  Listings/name:  ${CONFIG.LISTINGS_PER_NAME}`);
+  console.log(`  Name delay:     ${CONFIG.CSFLOAT_NAME_DELAY_MS / 1000}s`);
+  console.log(`  Est. scan time: ~${((ALL_KNIFE_NAMES.length * CONFIG.CSFLOAT_NAME_DELAY_MS) / 60000).toFixed(0)} min`);
+  console.log(`  Top N:          ${CONFIG.TOP_N}`);
+  console.log(`  Min spread:     $${CONFIG.MIN_SPREAD_USD}`);
+  console.log(`  Poll interval:  ${CONFIG.POLL_INTERVAL_SECONDS > 0 ? CONFIG.POLL_INTERVAL_SECONDS + "s" : "single run"}`);
+  console.log(`  Telegram:       ${CONFIG.TELEGRAM_BOT_TOKEN ? "active (chat " + CONFIG.TELEGRAM_CHAT_ID + ")" : "disabled"}`);
   console.log("");
-
-  // Print the full name list so the user can verify what will be scanned
-  if (CONFIG.DEBUG) {
-    console.log("  ── Names to scan ─────────────────────────────────────────────────────");
-    ALL_KNIFE_NAMES.forEach((n, i) => console.log(`  ${String(i + 1).padStart(3)}. ${n}`));
-    console.log("");
-  }
 
   await scan();
 
@@ -720,6 +780,7 @@ async function main() {
     log(`\n  Polling every ${CONFIG.POLL_INTERVAL_SECONDS}s. Ctrl+C to stop.`);
     setInterval(scan, CONFIG.POLL_INTERVAL_SECONDS * 1000);
   } else {
+    if (USE_STEAM) saveSteamCache();
     log("  Single-run complete. Set POLL_INTERVAL_SECONDS>0 to keep running.");
     process.exit(0);
   }
@@ -736,13 +797,21 @@ function buildCrashMsg(reason, label) {
 }
 
 process.on("uncaughtException", (err) => {
+  if (USE_STEAM) saveSteamCache();
   console.error("[CRASH] uncaughtException:", err);
   sendTelegram(buildCrashMsg(err, "uncaughtException")).catch(() => {}).finally(() => process.exit(1));
 });
 
 process.on("unhandledRejection", (reason) => {
+  if (USE_STEAM) saveSteamCache();
   console.error("[CRASH] unhandledRejection:", reason);
   sendTelegram(buildCrashMsg(reason, "unhandledRejection")).catch(() => {}).finally(() => process.exit(1));
+});
+
+process.on("SIGINT", () => {
+  log("\n  Interrupted — saving Steam cache...");
+  if (USE_STEAM) saveSteamCache();
+  process.exit(0);
 });
 
 main();
