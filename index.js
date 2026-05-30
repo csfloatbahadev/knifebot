@@ -2,7 +2,7 @@ require("dotenv").config();
 
 const fs   = require("fs");
 const path = require("path");
-const { Pool } = require("undici");
+const { Pool, request: undiciRequest } = require("undici");
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STATIC KNIFE NAME LIST
@@ -10,7 +10,6 @@ const { Pool } = require("undici");
 
 const WEARS = ["Factory New", "Minimal Wear", "Field-Tested", "Well-Worn", "Battle-Scarred"];
 
-// Skins that only come in specific wears
 const WEAR_OVERRIDE = {
   "Doppler":       ["Factory New", "Minimal Wear"],
   "Gamma Doppler": ["Factory New", "Minimal Wear"],
@@ -47,8 +46,8 @@ function buildNames(knifeBase, skins) {
   return names;
 }
 
-const KARAMBIT_NAMES = buildNames("Karambit", [...SHARED_SKINS, ...KARAMBIT_ONLY_SKINS]);
-const TALON_NAMES    = buildNames("Talon Knife", SHARED_SKINS);
+const KARAMBIT_NAMES  = buildNames("Karambit",   [...SHARED_SKINS, ...KARAMBIT_ONLY_SKINS]);
+const TALON_NAMES     = buildNames("Talon Knife", SHARED_SKINS);
 const ALL_KNIFE_NAMES = [...new Set([...KARAMBIT_NAMES, ...TALON_NAMES])].sort();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,9 +64,9 @@ const CONFIG = {
   // "steam_min_listing"   → Steam priceoverview lowest_price
   PRICE_SOURCE: (process.env.PRICE_SOURCE || "csfloat_base").trim(),
 
-  TOP_N:              Math.min(50, Math.max(1, parseInt(process.env.TOP_N)              || 10)),
-  LISTINGS_PER_NAME:  Math.min(50, Math.max(1, parseInt(process.env.LISTINGS_PER_NAME) || 10)),
-  MIN_SPREAD_USD:     parseFloat(process.env.MIN_SPREAD_USD) || 0,
+  TOP_N:             Math.min(50, Math.max(1, parseInt(process.env.TOP_N)             || 10)),
+  LISTINGS_PER_NAME: Math.min(50, Math.max(1, parseInt(process.env.LISTINGS_PER_NAME) || 10)),
+  MIN_SPREAD_USD:    parseFloat(process.env.MIN_SPREAD_USD) || 0,
   POLL_INTERVAL_SECONDS: parseInt(process.env.POLL_INTERVAL_SECONDS) || 0,
 
   // CSFloat: minimum 20s between listing requests
@@ -79,10 +78,10 @@ const CONFIG = {
   // Steam: delay between requests, cache TTL, and per-item retry count
   STEAM_REQUEST_DELAY_MS:  Math.max(1500, parseInt(process.env.STEAM_REQUEST_DELAY_MS)  || 3000),
   STEAM_CACHE_TTL_SECONDS: Math.max(300,  parseInt(process.env.STEAM_CACHE_TTL_SECONDS) || 3600),
-  STEAM_RETRIES:           Math.max(1,    parseInt(process.env.STEAM_RETRIES)           || 2),
+  STEAM_RETRIES:           Math.max(1,    parseInt(process.env.STEAM_RETRIES)           || 3),
   // How long to cool down after N consecutive Steam failures
-  STEAM_BACKOFF_MS:        Math.max(30000, parseInt(process.env.STEAM_BACKOFF_MS) || 60000),
-  STEAM_FAIL_THRESHOLD:    Math.max(1,     parseInt(process.env.STEAM_FAIL_THRESHOLD) || 5),
+  STEAM_BACKOFF_MS:     Math.max(30000, parseInt(process.env.STEAM_BACKOFF_MS)     || 60000),
+  STEAM_FAIL_THRESHOLD: Math.max(1,     parseInt(process.env.STEAM_FAIL_THRESHOLD) || 5),
 
   // Path to persist the Steam price cache between runs
   STEAM_CACHE_FILE: process.env.STEAM_CACHE_FILE || path.join(__dirname, "steam-cache.json"),
@@ -117,10 +116,10 @@ let csfloatBackoffUntil = 0;
 let csfloatBackoffLevel = 0;
 
 // Steam state
-let steamRateLimitUntil      = 0;   // don't touch Steam until this timestamp
-let steamConsecutiveFails     = 0;   // consecutive "no data" responses
-const steamNameidCache        = new Map();
-const steamPriceCache         = new Map(); // key → { cents, ts }
+let steamRateLimitUntil   = 0;
+let steamConsecutiveFails = 0;
+const steamNameidCache    = new Map();
+const steamPriceCache     = new Map(); // key → { cents, ts }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STEAM DISK CACHE
@@ -168,10 +167,11 @@ const csfloatPool = new Pool("https://csfloat.com", {
 const steamPool = USE_STEAM
   ? new Pool("https://steamcommunity.com", {
       connections: 2,
-      pipelining:  0,                  // no pipelining — Steam is finicky
+      pipelining:  0,
       keepAliveTimeout:    30_000,
       keepAliveMaxTimeout: 60_000,
-      maxRedirections:     5,
+      // NOTE: maxRedirections on Pool has no effect — redirects are handled
+      // manually in steamGet() using undiciRequest() with dispatch options.
       connect: { rejectUnauthorized: true },
     })
   : null;
@@ -191,8 +191,10 @@ function fmt(cents)     { return "$" + (cents / 100).toFixed(2); }
 function fmtSign(cents) { return (cents >= 0 ? "+" : "") + fmt(cents); }
 function h(text) {
   return String(text)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    .replace(/&/g,  "&amp;")
+    .replace(/</g,  "&lt;")
+    .replace(/>/g,  "&gt;")
+    .replace(/"/g,  "&quot;");
 }
 function log(...args) { console.log("[" + new Date().toISOString() + "]", ...args); }
 
@@ -251,7 +253,6 @@ async function csfloatRequest(path) {
 }
 
 async function fetchListingsForName(marketHashName) {
-  // Use encodeURIComponent so ★ → %E2%98%85 and space → %20 (not +)
   const params =
     `market_hash_name=${encodeURIComponent(marketHashName)}` +
     `&type=buy_now` +
@@ -283,29 +284,31 @@ function getCsfloatBasePrice(listing) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  STEAM API
 //
-//  Key fixes vs the original:
-//  1. encodeURIComponent for all name params (★ and spaces properly encoded)
-//  2. Browser-realistic headers: Referer, Accept-Language, X-Requested-With
-//  3. HTML-response detection (Steam returns HTML on blocks/captchas)
-//  4. Retry with longer delay on failure
-//  5. Global rate-limit state: after STEAM_FAIL_THRESHOLD consecutive fails,
-//     pause all Steam requests for STEAM_BACKOFF_MS
-//  6. Disk-persisted cache so prices survive restarts
+//  FIX SUMMARY vs original:
+//  1. Removed trailing slash from /market/priceoverview  (was causing 301
+//     redirects that undici Pool silently failed on — root cause of all
+//     "no data" returns for existing items)
+//  2. steamGet() now follows redirects manually via undici.request() with
+//     maxRedirections:5 (Pool-level option does NOT work on bare pools)
+//  3. Increased default STEAM_RETRIES to 3
+//  4. All other logic (backoff, fail counter, cache, headers) unchanged
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Steam browser-like request headers
 const STEAM_HEADERS = {
-  "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Accept":          "application/json, text/javascript, */*; q=0.01",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Accept-Encoding": "gzip, deflate, br",
-  "Referer":         "https://steamcommunity.com/market/",
-  "X-Requested-With":"XMLHttpRequest",
-  "Sec-Fetch-Dest":  "empty",
-  "Sec-Fetch-Mode":  "cors",
-  "Sec-Fetch-Site":  "same-origin",
+  "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept":           "application/json, text/javascript, */*; q=0.01",
+  "Accept-Language":  "en-US,en;q=0.9",
+  "Accept-Encoding":  "gzip, deflate, br",
+  "Referer":          "https://steamcommunity.com/market/",
+  "X-Requested-With": "XMLHttpRequest",
+  "Sec-Fetch-Dest":   "empty",
+  "Sec-Fetch-Mode":   "cors",
+  "Sec-Fetch-Site":   "same-origin",
 };
 
+// ── Core HTTP helper — follows redirects properly ─────────────────────────────
+// undici Pool.request() does NOT follow redirects even with maxRedirections set.
+// We use the top-level undiciRequest() which DOES honour maxRedirections.
 async function steamGet(requestPath) {
   // Global Steam rate-limit gate
   if (Date.now() < steamRateLimitUntil) {
@@ -314,13 +317,16 @@ async function steamGet(requestPath) {
     await sleep(wait);
   }
 
+  const fullUrl = "https://steamcommunity.com" + requestPath;
+
   for (let attempt = 1; attempt <= CONFIG.STEAM_RETRIES; attempt++) {
     let statusCode, text;
     try {
-      const resp = await steamPool.request({
-        method:  "GET",
-        path:    requestPath,
-        headers: STEAM_HEADERS,
+      // Use top-level undiciRequest so maxRedirections is honoured
+      const resp = await undiciRequest(fullUrl, {
+        method:          "GET",
+        headers:         STEAM_HEADERS,
+        maxRedirections: 5,   // ← works here; does NOT work on Pool.request()
       });
       statusCode = resp.statusCode;
       text = await resp.body.text();
@@ -371,7 +377,6 @@ async function getSteamNameid(name) {
 
   await sleep(CONFIG.STEAM_REQUEST_DELAY_MS);
 
-  // encodeURIComponent: space → %20, ★ → %E2%98%85, | → %7C
   const requestPath = "/market/listings/730/" + encodeURIComponent(name);
   const html = await steamGet(requestPath);
   if (!html) return null;
@@ -387,7 +392,7 @@ async function getSteamNameid(name) {
   return match[1];
 }
 
-// ── Max buy order ──────────────────────────────────────────────────────────────
+// ── Max buy order ─────────────────────────────────────────────────────────────
 async function getSteamMaxBuyOrder(name) {
   const cacheKey = name + ":max_buy_order";
   const ttlMs    = CONFIG.STEAM_CACHE_TTL_SECONDS * 1000;
@@ -399,7 +404,6 @@ async function getSteamMaxBuyOrder(name) {
 
   await sleep(CONFIG.STEAM_REQUEST_DELAY_MS);
 
-  // Build URL manually so spaces → %20, not +
   const requestPath =
     `/market/itemordershistogram` +
     `?country=US&language=english&currency=1` +
@@ -438,13 +442,12 @@ async function getSteamMinListing(name) {
 
   await sleep(CONFIG.STEAM_REQUEST_DELAY_MS);
 
-  // IMPORTANT: build URL manually with encodeURIComponent so:
-  //   space → %20  (not +, which URLSearchParams produces)
-  //   ★     → %E2%98%85
-  //   |     → %7C
-  // Steam's priceoverview API requires proper percent-encoding.
+  // FIX: NO trailing slash on /market/priceoverview
+  // The original had /market/priceoverview/ (with slash) which Steam redirects
+  // to /market/priceoverview (no slash) via 301. undici Pool.request() does NOT
+  // follow redirects, so every call silently returned null.
   const requestPath =
-    `/market/priceoverview/` +
+    `/market/priceoverview` +
     `?appid=730&currency=1` +
     `&market_hash_name=${encodeURIComponent(name)}`;
 
@@ -463,8 +466,8 @@ async function getSteamMinListing(name) {
     return null;
   }
 
-  const raw    = data.lowest_price;
-  if (!raw) return null;                               // no listings on Steam
+  const raw = data.lowest_price;
+  if (!raw) return null;
   const parsed = parseFloat(String(raw).replace(/[^0-9.]/g, ""));
   if (isNaN(parsed) || parsed <= 0) return null;
 
@@ -562,12 +565,12 @@ function buildTelegramReport(results, scanMs) {
     `<i>Karambit + Talon  |  ${h(srcShort)}  |  ${(scanMs / 1000).toFixed(1)}s</i>\n\n`;
 
   for (let i = 0; i < results.length; i++) {
-    const r         = results[i];
-    const emoji     = r.spreadCents >= 500 ? "✅" : r.spreadCents >= 0 ? "🟡" : "🔴";
-    const sign      = r.spreadCents >= 0 ? "+" : "";
-    const url       = "https://csfloat.com/item/" + r.listingId;
-    const refLabel  = CONFIG.PRICE_SOURCE === "csfloat_base" ? "Base" :
-                      CONFIG.PRICE_SOURCE === "steam_max_buy_order" ? "Steam BO" : "Steam lst";
+    const r        = results[i];
+    const emoji    = r.spreadCents >= 500 ? "✅" : r.spreadCents >= 0 ? "🟡" : "🔴";
+    const sign     = r.spreadCents >= 0 ? "+" : "";
+    const url      = "https://csfloat.com/item/" + r.listingId;
+    const refLabel = CONFIG.PRICE_SOURCE === "csfloat_base"        ? "Base"     :
+                     CONFIG.PRICE_SOURCE === "steam_max_buy_order"  ? "Steam BO" : "Steam lst";
 
     msg +=
       `${emoji} <b>${i + 1}. ${h(r.name)}</b>\n` +
@@ -612,19 +615,19 @@ async function scan() {
   const scanStart = Date.now();
   log(`\n══ SCAN #${scanCount}  [${CONFIG.PRICE_SOURCE}]  ${ALL_KNIFE_NAMES.length} names ${"═".repeat(25)}`);
 
-  const results          = [];
-  let namesWithListings  = 0;
-  let namesEmpty         = 0;
-  let totalListings      = 0;
-  let steamHits          = 0;
-  let steamMisses        = 0;
+  const results         = [];
+  let namesWithListings = 0;
+  let namesEmpty        = 0;
+  let totalListings     = 0;
+  let steamHits         = 0;
+  let steamMisses       = 0;
 
-  // ── 1. Pre-fetch Steam prices (batched, before the slow CSFloat loop) ──────
+  // ── 1. Pre-fetch Steam prices ─────────────────────────────────────────────
   if (USE_STEAM) {
-    // Vanilla knives usually have no Steam market listing — skip them
+    // Vanilla knives have no Steam market listing — skip them
     const steamNames = ALL_KNIFE_NAMES.filter(
-      (n) => n !== "★ Karambit" && n !== "★ StatTrak™ Karambit" &&
-             n !== "★ Talon Knife" && n !== "★ StatTrak™ Talon Knife"
+      (n) => n !== "★ Karambit"          && n !== "★ StatTrak™ Karambit" &&
+             n !== "★ Talon Knife"        && n !== "★ StatTrak™ Talon Knife"
     );
 
     // Only fetch names not already in cache
@@ -657,14 +660,13 @@ async function scan() {
       }
     }
 
-    // Persist updated cache to disk
     saveSteamCache();
 
     const cacheTotal = steamPriceCache.size;
     log(`  [Steam]  Pre-fetch done. Hits: ${steamHits}, Misses: ${steamMisses}, Cache total: ${cacheTotal}`);
   }
 
-  // ── 2. Per-name CSFloat loop ───────────────────────────────────────────────
+  // ── 2. Per-name CSFloat loop ──────────────────────────────────────────────
   for (let i = 0; i < ALL_KNIFE_NAMES.length; i++) {
     const name = ALL_KNIFE_NAMES[i];
     const pct  = ((i / ALL_KNIFE_NAMES.length) * 100).toFixed(0);
@@ -747,7 +749,6 @@ async function main() {
     process.exit(1);
   }
 
-  // Load Steam disk cache before printing startup banner
   if (USE_STEAM) loadSteamCache();
 
   console.log("╔══════════════════════════════════════════════════════╗");
